@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QEvent,
     QModelIndex,
     QObject,
     QLocale,
@@ -1194,6 +1195,7 @@ class MessageRowWidget(QFrame):
         self._copy_code_cb = copy_code_cb
         self._message: Optional[Message] = None
         self._index_display = 0
+        self._last_emitted_size_hint: Optional[QSize] = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1303,12 +1305,18 @@ class MessageRowWidget(QFrame):
         self._schedule_relayout()
 
     def _schedule_relayout(self) -> None:
+        # First pass catches immediate layout; second pass catches QTextDocument settling.
         QTimer.singleShot(0, self._emit_size_hint)
+        QTimer.singleShot(30, self._emit_size_hint)
 
     def _emit_size_hint(self) -> None:
         self.updateGeometry()
         self.adjustSize()
-        self.relayoutRequested.emit(self.key, self.sizeHint())
+        size = self.sizeHint()
+        if self._last_emitted_size_hint == size:
+            return
+        self._last_emitted_size_hint = QSize(size)
+        self.relayoutRequested.emit(self.key, size)
 
 
 class MessageListPane(QWidget):
@@ -1438,6 +1446,7 @@ class MessageListPane(QWidget):
         self.list_view.setStyleSheet(
             "QListView { background: #f5f7fb; border: 1px solid #dbe2ea; border-radius: 10px; padding: 6px; }"
         )
+        self.list_view.viewport().installEventFilter(self)
         layout.addWidget(self.list_view, 1)
 
     def _connect_model(self) -> None:
@@ -1495,13 +1504,35 @@ class MessageListPane(QWidget):
 
         index = self.model.index(row, 0)
         self.list_view.setIndexWidget(index, widget)
+        self._apply_row_width(widget)
         widget.set_message(msg, row + 1)
 
     @Slot(str, QSize)
     def _on_row_relayout_requested(self, key: str, size_hint: QSize) -> None:
-        padded = QSize(max(360, size_hint.width() + 8), max(70, size_hint.height() + 8))
+        widget = self._widgets_by_key.get(key)
+        if widget:
+            self._apply_row_width(widget)
+        # Keep rows full-width in the list; only the height should track content size.
+        viewport_w = max(360, self.list_view.viewport().width() - 12)
+        padded = QSize(viewport_w, max(70, size_hint.height() + 8))
         self.model.update_size_hint(key, padded)
         self.list_view.doItemsLayout()
+
+    def _apply_row_width(self, widget: MessageRowWidget) -> None:
+        target_w = max(360, self.list_view.viewport().width() - 14)
+        if widget.width() != target_w:
+            widget.setFixedWidth(target_w)
+
+    def _apply_widths_to_all_rows(self) -> None:
+        for widget in self._widgets_by_key.values():
+            self._apply_row_width(widget)
+
+    def eventFilter(self, watched: QObject, event) -> bool:  # type: ignore[override]
+        if watched is self.list_view.viewport() and event.type() == QEvent.Resize:
+            self._apply_widths_to_all_rows()
+            # Width changes can change wrapping, so request a lazy relayout on visible rows.
+            QTimer.singleShot(0, self.list_view.doItemsLayout)
+        return super().eventFilter(watched, event)
 
     def copy_message(self, key: str) -> None:
         row = self.model.row_for_key(key)
