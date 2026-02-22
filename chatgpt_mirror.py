@@ -1841,10 +1841,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Esporta", "Nessun messaggio da esportare.")
             return
 
+        base_name = self._default_export_basename()
         fmt = fmt.lower().strip()
         if fmt == "md":
             path, _ = QFileDialog.getSaveFileName(
-                self, "Esporta Markdown", "chatgpt_mirror_export.md", "Markdown (*.md)"
+                self, "Esporta Markdown", f"{base_name}.md", "Markdown (*.md)"
             )
             if not path:
                 return
@@ -1853,7 +1854,7 @@ class MainWindow(QMainWindow):
 
         if fmt == "json":
             path, _ = QFileDialog.getSaveFileName(
-                self, "Esporta JSON", "chatgpt_mirror_export.json", "JSON (*.json)"
+                self, "Esporta JSON", f"{base_name}.json", "JSON (*.json)"
             )
             if not path:
                 return
@@ -1879,12 +1880,50 @@ class MainWindow(QMainWindow):
 
         if fmt == "pdf":
             path, _ = QFileDialog.getSaveFileName(
-                self, "Esporta PDF", "chatgpt_mirror_export.pdf", "PDF (*.pdf)"
+                self, "Esporta PDF", f"{base_name}.pdf", "PDF (*.pdf)"
             )
             if not path:
                 return
             self._export_pdf_from_markdown(self._conversation_as_markdown(messages), path)
             return
+
+    def _default_export_basename(self) -> str:
+        title = self._current_chat_title_guess()
+        if not title:
+            return "chatgpt_mirror_export"
+        safe = self._sanitize_filename_component(title)
+        return safe or "chatgpt_mirror_export"
+
+    def _current_chat_title_guess(self) -> str:
+        title = ""
+        try:
+            title = (self.web_view.page().title() or "").strip()
+        except Exception:
+            title = ""
+        if not title:
+            try:
+                title = (self.web_view.title() or "").strip()
+            except Exception:
+                title = ""
+        # Best-effort cleanup for common ChatGPT page title suffixes.
+        for sep in (" - ", " | "):
+            if sep in title:
+                left, right = title.rsplit(sep, 1)
+                if right.strip().lower() == "chatgpt" and left.strip():
+                    title = left.strip()
+                    break
+        if title.strip().lower() == "chatgpt":
+            return ""
+        return title.strip()
+
+    def _sanitize_filename_component(self, value: str) -> str:
+        v = (value or "").strip()
+        v = re.sub(r"[\\/:*?\"<>|]+", "_", v)
+        v = re.sub(r"\s+", " ", v).strip()
+        v = v.strip(". ")
+        if len(v) > 120:
+            v = v[:120].rstrip()
+        return v
 
     def _conversation_as_markdown(self, messages: List[Message]) -> str:
         lines: List[str] = ["# ChatGPT Mirror Export", ""]
@@ -1933,7 +1972,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Debug export", "Messaggio non trovato nel modello.")
             return
 
-        default_name = f"chatgpt_mirror_debug_{key[:32].replace('/', '_')}.txt"
+        chat_base = self._default_export_basename()
+        default_name = (
+            f"{chat_base}__debug_{key[:32].replace('/', '_')}.txt"
+            if chat_base
+            else f"chatgpt_mirror_debug_{key[:32].replace('/', '_')}.txt"
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Esporta debug blocco visibile", default_name, "Text (*.txt)"
         )
