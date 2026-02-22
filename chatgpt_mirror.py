@@ -348,30 +348,6 @@ JS_INJECTOR = r"""
       for (var i = 0; i < kids.length; i++) visit(kids[i]);
     }
 
-    function isBoldOnlyParagraph(el) {
-      if (!el || !(el instanceof Element)) return false;
-      if ((el.tagName || '').toLowerCase() !== 'p') return false;
-      var meaningful = [];
-      var kids = el.childNodes || [];
-      for (var i = 0; i < kids.length; i++) {
-        var k = kids[i];
-        if (k.nodeType === Node.TEXT_NODE) {
-          if ((k.textContent || '').trim()) meaningful.push(k);
-          continue;
-        }
-        if (k.nodeType === Node.ELEMENT_NODE) {
-          if (shouldSkipUI(k)) continue;
-          meaningful.push(k);
-        }
-      }
-      if (meaningful.length !== 1) return false;
-      var only = meaningful[0];
-      if (only.nodeType !== Node.ELEMENT_NODE) return false;
-      var tag = (only.tagName || '').toLowerCase();
-      if (!(tag === 'strong' || tag === 'b')) return false;
-      return !!(only.innerText || '').trim();
-    }
-
     function ensureLineBreak() {
       if (!textBuf.endsWith('\n')) textBuf += '\n';
     }
@@ -436,19 +412,6 @@ JS_INJECTOR = r"""
       if (tag === 'p' && el.parentElement && el.parentElement.tagName && el.parentElement.tagName.toLowerCase() === 'li') {
         visitChildren(el);
         return;
-      }
-
-      // Avoid Qt markdown parser ambiguity for lines that are only "**text**" (it may parse
-      // them as list items). Render them as a small heading instead.
-      if (tag === 'p' && isBoldOnlyParagraph(el)) {
-        var pText = (el.innerText || '').trim();
-        if (pText) {
-          ensureLineBreak();
-          appendText('### ' + escapeMarkdownText(pText));
-          ensureLineBreak();
-          ensureLineBreak();
-          return;
-        }
       }
 
       if (tag === 'strong' || tag === 'b') {
@@ -953,11 +916,10 @@ class MarkdownTextWidget(QTextBrowser):
             code { font-family: "DejaVu Sans Mono"; }
             """
         )
-        render_md = normalize_markdown_for_qt_render(markdown_text or "")
         try:
-            self.setMarkdown(render_md)
+            self.setMarkdown(markdown_text or "")
         except Exception:
-            self.setPlainText(render_md)
+            self.setPlainText(markdown_text or "")
         self._sync_height()
         doc.contentsChanged.connect(self._on_contents_changed)
 
@@ -987,58 +949,6 @@ def preview_from_markdown(markdown_text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def normalize_markdown_for_qt_render(markdown_text: str) -> str:
-    """
-    Qt's markdown parser can misinterpret some ChatGPT-emitted patterns, especially:
-    - standalone bold subtitle lines becoming list items
-    - subsequent bullets rendered as progressively nested
-    This function rewrites those patterns only for UI rendering.
-    """
-    lines = (markdown_text or "").splitlines()
-    out: List[str] = []
-    i = 0
-
-    bullet_subtitle_re = re.compile(r"^\s*-\s+\*\*([^*][^*]{0,80}?)\*\*\s*$")
-    list_item_re = re.compile(r"^(\s*)-\s+.+$")
-
-    while i < len(lines):
-        line = lines[i]
-        m = bullet_subtitle_re.match(line)
-        if m:
-            title = m.group(1).strip()
-            # Look ahead for following list items. If present, this is almost certainly
-            # a parser artifact and should be a subtitle, not a bullet item.
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines) and list_item_re.match(lines[j]):
-                out.append(f"### {title}")
-                # De-indent one nesting level from the following contiguous list block.
-                k = j
-                while k < len(lines):
-                    cur = lines[k]
-                    if not cur.strip():
-                        out.append(cur)
-                        k += 1
-                        continue
-                    m_item = list_item_re.match(cur)
-                    if not m_item:
-                        break
-                    indent = m_item.group(1)
-                    if indent.startswith("    "):
-                        out.append(cur[4:])
-                    else:
-                        out.append(cur)
-                    k += 1
-                i = k
-                continue
-
-        out.append(line)
-        i += 1
-
-    return "\n".join(out)
-
-
 @dataclass
 class MessagePart:
     type: str
@@ -1062,7 +972,7 @@ class Message:
         chunks: List[str] = []
         for part in self.parts:
             if part.type == "text" and part.text.strip():
-                chunks.append(preview_from_markdown(normalize_markdown_for_qt_render(part.text.strip())))
+                chunks.append(preview_from_markdown(part.text.strip()))
             elif part.type == "code" and part.code.strip():
                 lang = part.lang.strip()
                 head = f"[code:{lang}] " if lang else "[code] "
@@ -2002,7 +1912,6 @@ class MainWindow(QMainWindow):
         # Build local debug payload first (available immediately).
         text_parts_md = [p.text for p in msg.parts if p.type == "text" and p.text.strip()]
         raw_md = "\n\n".join(text_parts_md).strip()
-        qt_md = normalize_markdown_for_qt_render(raw_md)
         parts_json = json.dumps(
             [
                 (
@@ -2048,7 +1957,7 @@ class MainWindow(QMainWindow):
                     raw_md or "[vuoto]",
                     "",
                     "=== QT MARKDOWN (post-normalizzazione) ===",
-                    qt_md or "[vuoto]",
+                    "[normalizzazione Qt rimossa]",
                     "",
                     "=== DOM OUTER HTML (WebView) ===",
                     dom_text,
