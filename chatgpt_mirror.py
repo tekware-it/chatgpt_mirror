@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import time
+from html import escape as html_escape
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -62,6 +63,22 @@ from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtPrintSupport import QPrinter
+
+try:
+    from pygments import highlight as pygments_highlight
+    from pygments.formatters import HtmlFormatter
+    from pygments.lexers import get_lexer_by_name
+    from pygments.lexers.special import TextLexer
+
+    PYGMENTS_AVAILABLE = True
+except Exception:
+    PYGMENTS_AVAILABLE = False
+    pygments_highlight = None  # type: ignore[assignment]
+    HtmlFormatter = None  # type: ignore[assignment]
+    get_lexer_by_name = None  # type: ignore[assignment]
+    TextLexer = None  # type: ignore[assignment]
+
+PDF_PYGMENTS_STYLE = "default"
 
 
 JS_INJECTOR = r"""
@@ -2109,7 +2126,7 @@ class MainWindow(QMainWindow):
             )
             if not path:
                 return
-            self._export_pdf_from_markdown(self._conversation_as_markdown(messages), path)
+            self._export_pdf_from_messages(messages, path)
             return
 
     def _default_export_basename(self) -> str:
@@ -2163,13 +2180,146 @@ class MainWindow(QMainWindow):
                         lines.append(txt)
                         lines.append("")
                 elif part.type == "code":
-                    lang = (part.lang or "").strip()
+                    lang = normalize_code_lang((part.lang or "").strip())
                     code = part.code.rstrip("\n")
                     lines.append(f"```{lang}")
                     lines.append(code)
                     lines.append("```")
                     lines.append("")
         return "\n".join(lines).rstrip() + "\n"
+
+    def _markdown_fragment_to_html(self, markdown_text: str) -> str:
+        doc = QTextDocument(self)
+        try:
+            doc.setMarkdown(markdown_text or "")
+        except Exception:
+            doc.setPlainText(markdown_text or "")
+        html = doc.toHtml()
+        m = re.search(r"<body[^>]*>(.*)</body>", html, flags=re.IGNORECASE | re.DOTALL)
+        return m.group(1) if m else html
+
+    def _code_html_for_pdf(self, code: str, lang: str) -> str:
+        code = code.rstrip("\n")
+        lang = normalize_code_lang(lang)
+        if PYGMENTS_AVAILABLE and pygments_highlight and HtmlFormatter and get_lexer_by_name and TextLexer:
+            try:
+                lexer = get_lexer_by_name(lang) if lang else TextLexer()
+            except Exception:
+                lexer = TextLexer()
+            formatter = HtmlFormatter(cssclass="codehilite", nowrap=False, style=PDF_PYGMENTS_STYLE)
+            highlighted = pygments_highlight(code, lexer, formatter)
+            title = html_escape(lang or "code")
+            return (
+                f'<div class="code-wrap"><div class="code-head">{title}</div>'
+                f'{highlighted}</div>'
+            )
+        # Fallback: no Pygments installed
+        title = html_escape(lang or "code")
+        return (
+            f'<div class="code-wrap"><div class="code-head">{title}</div>'
+            f'<pre class="codehilite"><code>{html_escape(code)}</code></pre></div>'
+        )
+
+    def _conversation_as_html_for_pdf(self, messages: List[Message]) -> str:
+        pygments_css = ""
+        if PYGMENTS_AVAILABLE and HtmlFormatter:
+            try:
+                pygments_css = HtmlFormatter(
+                    cssclass="codehilite",
+                    style=PDF_PYGMENTS_STYLE,
+                ).get_style_defs(".codehilite")
+            except Exception:
+                pygments_css = ""
+
+        blocks: List[str] = []
+        for i, msg in enumerate(messages, start=1):
+            role = "You" if msg.role == "user" else "Assistant"
+            role_class = "user" if msg.role == "user" else "assistant"
+            blocks.append(
+                f'<section class="msg {role_class}"><div class="msg-head">{i}. {html_escape(role)}</div>'
+            )
+            for part in msg.parts:
+                if part.type == "text":
+                    txt = part.text.strip()
+                    if txt:
+                        blocks.append(f'<div class="text-part">{self._markdown_fragment_to_html(txt)}</div>')
+                elif part.type == "code":
+                    blocks.append(self._code_html_for_pdf(part.code, part.lang))
+            blocks.append("</section>")
+
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{
+      font-family: "DejaVu Sans", "Liberation Sans", "Noto Sans", "Ubuntu", sans-serif;
+      color: #111827;
+      font-size: 11pt;
+      line-height: 1.38;
+      margin: 0;
+    }}
+    h1,h2,h3,h4,h5,h6 {{ color: #111827; }}
+    p {{ margin: 0 0 8px 0; }}
+    .msg {{
+      border: 1px solid #dbe2ea;
+      border-radius: 10px;
+      padding: 8pt 9pt;
+      margin: 0 0 10pt 0;
+      page-break-inside: avoid;
+    }}
+    .msg-head {{
+      font-weight: 700;
+      font-size: 10.5pt;
+      margin-bottom: 6pt;
+      color: #1f2937;
+    }}
+    .msg.user .msg-head {{ color: #065f46; }}
+    .msg.assistant .msg-head {{ color: #1e3a8a; }}
+    .text-part {{ margin-bottom: 6px; }}
+    .code-wrap {{
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      overflow: hidden;
+      margin: 5pt 0 8pt 0;
+      page-break-inside: avoid;
+      background: #ffffff;
+    }}
+    .code-head {{
+      background: #e2e8f0;
+      color: #1f2937;
+      font-size: 8.5pt;
+      font-weight: 600;
+      padding: 3pt 6pt;
+      border-bottom: 1px solid #cbd5e1;
+      text-transform: lowercase;
+    }}
+    pre.codehilite, .codehilite {{
+      margin: 0;
+      padding: 6pt 7pt;
+      background: #f8fafc !important;
+      color: #111827;
+      font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+      font-size: 9.5pt;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }}
+    .codehilite pre {{ margin: 0; white-space: pre-wrap; }}
+    code {{ font-family: "DejaVu Sans Mono", monospace; }}
+    blockquote {{
+      border-left: 3px solid #cbd5e1;
+      padding-left: 8px;
+      color: #374151;
+      margin: 6px 0;
+    }}
+    a {{ color: #1d4ed8; text-decoration: none; }}
+    {pygments_css}
+  </style>
+</head>
+<body>
+{''.join(blocks)}
+</body>
+</html>"""
 
     def _export_pdf_from_markdown(self, markdown_text: str, path: str) -> None:
         printer = QPrinter(QPrinter.HighResolution)
@@ -2183,6 +2333,21 @@ class MainWindow(QMainWindow):
         except Exception:
             # Fallback for environments with limited markdown support.
             doc.setPlainText(markdown_text)
+        doc.print_(printer)
+
+    def _export_pdf_from_messages(self, messages: List[Message], path: str) -> None:
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(path)
+        # Real page margins for printed PDF (more reliable than CSS body margins in Qt rich text).
+        try:
+            printer.setPageMargins(12, 12, 12, 12, QPrinter.Millimeter)
+        except Exception:
+            pass
+
+        doc = QTextDocument(self)
+        doc.setDefaultFont(QApplication.font())
+        doc.setHtml(self._conversation_as_html_for_pdf(messages))
         doc.print_(printer)
 
     @Slot()
