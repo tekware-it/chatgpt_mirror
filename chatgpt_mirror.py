@@ -318,6 +318,7 @@ JS_INJECTOR = r"""
   function extractParts(node) {
     var parts = [];
     var textBuf = '';
+    var handledCodeContainers = new WeakSet();
     var blockTags = new Set([
       'p','div','section','article','header','footer','main','aside','blockquote',
       'ul','ol','li','table','thead','tbody','tr','td','th','h1','h2','h3','h4','h5','h6'
@@ -347,6 +348,87 @@ JS_INJECTOR = r"""
     function visitChildren(el) {
       var kids = el.childNodes || [];
       for (var i = 0; i < kids.length; i++) visit(kids[i]);
+    }
+
+    function classStr(el) {
+      try { return ((el.className || '') + '').toLowerCase(); } catch (e) { return ''; }
+    }
+
+    function isLikelyBlockCodeContainer(el) {
+      if (!(el instanceof Element)) return false;
+      if (handledCodeContainers.has(el)) return false;
+      var tag = (el.tagName || '').toLowerCase();
+      if (tag === 'pre') return true;
+
+      // Common custom code wrappers in modern UIs (including ChatGPT variants).
+      var dt = ((el.getAttribute && el.getAttribute('data-testid')) || '').toLowerCase();
+      var cls = classStr(el);
+      var hasCodeDesc = !!(el.querySelector && el.querySelector('code'));
+      if (!hasCodeDesc) return false;
+
+      if (dt.includes('code')) return true;
+      if (cls.includes('code-block') || cls.includes('codeblock')) return true;
+
+      // Some renderers use a div wrapper with a single multiline <code> child.
+      var directCode = el.children && el.children.length === 1 && el.firstElementChild &&
+        el.firstElementChild.tagName && el.firstElementChild.tagName.toLowerCase() === 'code';
+      if (directCode) {
+        var codeTxt = (el.firstElementChild.textContent || '');
+        if (codeTxt.includes('\n')) return true;
+      }
+
+      return false;
+    }
+
+    function codePartFromContainer(el) {
+      if (!(el instanceof Element)) return null;
+      var tag = (el.tagName || '').toLowerCase();
+      var codeNode = null;
+      var codeText = '';
+      if (tag === 'pre') {
+        // ChatGPT often renders code blocks as CodeMirror DOM inside <pre>, not <code>.
+        var cm = el.querySelector('.cm-content, [class*="cm-content"]');
+        if (cm) {
+          codeNode = cm;
+          codeText = (cm.innerText || cm.textContent || '').replace(/\r\n/g, '\n');
+        } else {
+          codeNode = el.querySelector('code');
+          if (codeNode) {
+            codeText = (codeNode.textContent || '').replace(/\r\n/g, '\n');
+          } else {
+            // Fallback for unknown <pre> variants: clone and strip obvious UI chrome.
+            var clonePre = el.cloneNode(true);
+            if (clonePre.querySelectorAll) {
+              clonePre.querySelectorAll('button, svg, [aria-label*="copia" i], [aria-label*="copy" i]').forEach(function(n) {
+                try { n.remove(); } catch (e) {}
+              });
+              clonePre.querySelectorAll('.sticky, [class*="sticky"]').forEach(function(n) {
+                try { n.remove(); } catch (e) {}
+              });
+            }
+            codeNode = clonePre;
+            codeText = (clonePre.innerText || clonePre.textContent || '').replace(/\r\n/g, '\n');
+          }
+        }
+      } else {
+        codeNode = el.querySelector('pre code') || el.querySelector('code');
+        if (codeNode) {
+          codeText = (codeNode.textContent || '').replace(/\r\n/g, '\n');
+        }
+      }
+      if (!codeNode) return null;
+      if (!codeText.trim()) return null;
+
+      // Guard against grabbing inline code wrappers as blocks.
+      if (!codeText.includes('\n') && codeText.length < 120 && tag !== 'pre') {
+        return null;
+      }
+
+      return {
+        type: 'code',
+        lang: bestEffortLang(tag === 'pre' ? el : (codeNode.closest('pre') || el)),
+        code: codeText
+      };
     }
 
     function ensureLineBreak() {
@@ -388,6 +470,16 @@ JS_INJECTOR = r"""
       if (tag === 'br') {
         appendText('\n');
         return;
+      }
+
+      if (isLikelyBlockCodeContainer(el)) {
+        var codePart = codePartFromContainer(el);
+        if (codePart) {
+          flushText();
+          parts.push(codePart);
+          handledCodeContainers.add(el);
+          return;
+        }
       }
 
       if (el.matches && el.matches('[data-testid*="webpage-citation-pill"]')) {
@@ -443,7 +535,7 @@ JS_INJECTOR = r"""
 
       if (tag === 'code') {
         // Inline code only (block code is handled by <pre> below)
-        if (!el.closest('pre')) {
+        if (!el.closest('pre') && !el.closest('[data-testid*="code"], .code-block, [class*="codeblock"], [class*="code-block"]')) {
           var inlineCode = (el.textContent || '').replace(/\r\n/g, ' ').trim();
           appendText('`' + inlineCode.replace(/`/g, '\\`') + '`');
           return;
@@ -485,19 +577,6 @@ JS_INJECTOR = r"""
             ensureLineBreak();
           });
           ensureLineBreak();
-          return;
-        }
-      }
-
-      if (tag === 'pre') {
-        var codeEl = el.querySelector('code');
-        if (codeEl) {
-          flushText();
-          parts.push({
-            type: 'code',
-            lang: bestEffortLang(el),
-            code: (codeEl.textContent || '').replace(/\r\n/g, '\n')
-          });
           return;
         }
       }
