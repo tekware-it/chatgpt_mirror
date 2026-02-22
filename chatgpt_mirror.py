@@ -15,6 +15,7 @@ Important constraints:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QSizePolicy,
     QSplitter,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -69,6 +71,7 @@ JS_INJECTOR = r"""
 
   var CONSOLE_DELTA_PREFIX = "__CGM_DELTA__";
   var CONSOLE_EVENT_PREFIX = "__CGM_EVT__";
+  var LIST_MARKER_PREFIX = "__CGM_LI__";
 
   function simpleHash(str) {
     var h = 5381;
@@ -80,17 +83,70 @@ JS_INJECTOR = r"""
 
   function normalizeWhitespace(text) {
     if (!text) return "";
-    return text
+    text = text
       .replace(/\r\n/g, "\n")
-      .replace(/\t/g, "  ")
-      .replace(/[ \u00a0]+/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+      .replace(/\u00a0/g, " ")
+      .replace(/\t/g, "    ");
+
+    var lines = text.split("\n").map(function(line) {
+      var raw = String(line || "").replace(/\s+$/g, "");
+      if (!raw.trim()) return "";
+      var trimmed = raw.trim();
+
+      // Deterministic list item marker emitted by extractor (avoids DOM whitespace chaos).
+      if (trimmed.startsWith(LIST_MARKER_PREFIX)) {
+        var m = trimmed.match(/^__CGM_LI__(\d+)__(.*)$/);
+        if (m) {
+          var level = Math.max(0, Math.min(6, parseInt(m[1], 10) || 0));
+          var rest = (m[2] || "").trim().replace(/[ ]{2,}/g, " ");
+          return "    ".repeat(level) + "- " + rest;
+        }
+      }
+
+      // ChatGPT sometimes renders bullets as plain text lines ("• ...") with visual indentation.
+      var bulletMatch = raw.match(/^(\s*)([•◦▪●])\s+(.*)$/);
+      if (bulletMatch) {
+        var leadingSpaces = (bulletMatch[1] || "").replace(/\t/g, "    ").length;
+        var levelFromIndent = Math.max(0, Math.min(6, Math.floor(leadingSpaces / 2)));
+        var bulletRest = String(bulletMatch[3] || "").trim().replace(/[ ]{2,}/g, " ");
+        return "    ".repeat(levelFromIndent) + "- " + bulletRest;
+      }
+
+      // Preserve user-visible markdown structures but normalize spacing.
+      if (/^(>\s+|[-*+]\s+|\d+\.\s+)/.test(trimmed)) {
+        return trimmed.replace(/[ ]{2,}/g, " ");
+      }
+
+      return trimmed.replace(/[ ]{2,}/g, " ");
+    });
+
+    return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function escapeMarkdownText(text) {
+    if (!text) return "";
+    return String(text)
+      .replace(/\\/g, "\\\\")
+      .replace(/([`*_{}\[\]()#+!<>|])/g, "\\$1");
   }
 
   function stripUiSpeechPrefixes(text) {
     if (!text) return "";
     var lines = text.split('\n');
+
+    // Generic UI label removal: if the first line is short and ends with ":", drop it.
+    // Examples: "Hai detto:", "ChatGPT ha detto:", "You said:"
+    if (lines.length > 1) {
+      var first = (lines[0] || '').trim();
+      if (first && first.endsWith(':')) {
+        var firstNoColon = first.slice(0, -1).trim();
+        var wordCount = firstNoColon ? firstNoColon.split(/\s+/).length : 0;
+        if (first.length <= 48 && wordCount <= 6) {
+          lines = lines.slice(1);
+        }
+      }
+    }
+
     var cleaned = lines.map(function(line) {
       return line.replace(
         /^\s*(you|chatgpt|assistant)\s+said:\s*/i,
@@ -282,6 +338,40 @@ JS_INJECTOR = r"""
       textBuf += t;
     }
 
+    function appendPlainText(t) {
+      if (!t) return;
+      textBuf += escapeMarkdownText(t);
+    }
+
+    function visitChildren(el) {
+      var kids = el.childNodes || [];
+      for (var i = 0; i < kids.length; i++) visit(kids[i]);
+    }
+
+    function isBoldOnlyParagraph(el) {
+      if (!el || !(el instanceof Element)) return false;
+      if ((el.tagName || '').toLowerCase() !== 'p') return false;
+      var meaningful = [];
+      var kids = el.childNodes || [];
+      for (var i = 0; i < kids.length; i++) {
+        var k = kids[i];
+        if (k.nodeType === Node.TEXT_NODE) {
+          if ((k.textContent || '').trim()) meaningful.push(k);
+          continue;
+        }
+        if (k.nodeType === Node.ELEMENT_NODE) {
+          if (shouldSkipUI(k)) continue;
+          meaningful.push(k);
+        }
+      }
+      if (meaningful.length !== 1) return false;
+      var only = meaningful[0];
+      if (only.nodeType !== Node.ELEMENT_NODE) return false;
+      var tag = (only.tagName || '').toLowerCase();
+      if (!(tag === 'strong' || tag === 'b')) return false;
+      return !!(only.innerText || '').trim();
+    }
+
     function ensureLineBreak() {
       if (!textBuf.endsWith('\n')) textBuf += '\n';
     }
@@ -290,7 +380,9 @@ JS_INJECTOR = r"""
       var norm = stripUiSpeechPrefixes(normalizeWhitespace(textBuf));
       if (norm) {
         if (parts.length && parts[parts.length - 1].type === 'text') {
-          parts[parts.length - 1].text = normalizeWhitespace(parts[parts.length - 1].text + "\n" + norm);
+          parts[parts.length - 1].text = stripUiSpeechPrefixes(
+            normalizeWhitespace(parts[parts.length - 1].text + "\n" + norm)
+          );
         } else {
           parts.push({ type: 'text', text: norm });
         }
@@ -301,7 +393,14 @@ JS_INJECTOR = r"""
     function visit(n) {
       if (!n) return;
       if (n.nodeType === Node.TEXT_NODE) {
-        appendText(n.textContent || '');
+        var tnode = n.textContent || '';
+        var parentTag = (n.parentElement && n.parentElement.tagName || '').toLowerCase();
+        // DOM formatting whitespace inside list containers (<li>\n  <p>...</p>\n</li>)
+        // must not become real newlines in markdown, otherwise "-" is split from item text.
+        if ((parentTag === 'li' || parentTag === 'ul' || parentTag === 'ol') && !tnode.trim()) {
+          return;
+        }
+        appendPlainText(tnode);
         return;
       }
       if (n.nodeType !== Node.ELEMENT_NODE) return;
@@ -312,6 +411,118 @@ JS_INJECTOR = r"""
       if (tag === 'br') {
         appendText('\n');
         return;
+      }
+
+      if (el.matches && el.matches('[data-testid*="webpage-citation-pill"]')) {
+        var a = el.querySelector('a[href]');
+        if (a) {
+          var hrefC = (a.getAttribute('href') || '').trim();
+          var labelC = '';
+          var labelNode = a.querySelector('span');
+          if (labelNode) labelC = (labelNode.innerText || '').trim();
+          if (!labelC) labelC = (a.innerText || '').replace(/\+\d+\s*$/,'').trim();
+          if (!labelC && hrefC) {
+            try { labelC = new URL(hrefC).hostname; } catch (e) { labelC = hrefC; }
+          }
+          if (hrefC && labelC) {
+            appendText(' [' + escapeMarkdownText(labelC) + '](' + hrefC + ')');
+          }
+        }
+        return;
+      }
+
+      // ChatGPT often uses <li><p>...</p></li>. If we treat <p> as a generic block here,
+      // the list marker and the text get split across lines, which breaks markdown nesting.
+      if (tag === 'p' && el.parentElement && el.parentElement.tagName && el.parentElement.tagName.toLowerCase() === 'li') {
+        visitChildren(el);
+        return;
+      }
+
+      // Avoid Qt markdown parser ambiguity for lines that are only "**text**" (it may parse
+      // them as list items). Render them as a small heading instead.
+      if (tag === 'p' && isBoldOnlyParagraph(el)) {
+        var pText = (el.innerText || '').trim();
+        if (pText) {
+          ensureLineBreak();
+          appendText('### ' + escapeMarkdownText(pText));
+          ensureLineBreak();
+          ensureLineBreak();
+          return;
+        }
+      }
+
+      if (tag === 'strong' || tag === 'b') {
+        appendText('**');
+        visitChildren(el);
+        appendText('**');
+        return;
+      }
+
+      if (tag === 'em' || tag === 'i') {
+        appendText('*');
+        visitChildren(el);
+        appendText('*');
+        return;
+      }
+
+      if (tag === 'a') {
+        var href = (el.getAttribute('href') || '').trim();
+        if (href) {
+          appendText('[');
+          visitChildren(el);
+          appendText('](' + href + ')');
+        } else {
+          visitChildren(el);
+        }
+        return;
+      }
+
+      if (tag === 'code') {
+        // Inline code only (block code is handled by <pre> below)
+        if (!el.closest('pre')) {
+          var inlineCode = (el.textContent || '').replace(/\r\n/g, ' ').trim();
+          appendText('`' + inlineCode.replace(/`/g, '\\`') + '`');
+          return;
+        }
+      }
+
+      if (/^h[1-6]$/.test(tag)) {
+        var level = parseInt(tag.slice(1), 10) || 1;
+        ensureLineBreak();
+        appendText('#'.repeat(level) + ' ');
+        visitChildren(el);
+        ensureLineBreak();
+        ensureLineBreak();
+        return;
+      }
+
+      if (tag === 'li') {
+        var depth = 0;
+        var p = el.parentElement;
+        while (p) {
+          var pt = (p.tagName || '').toLowerCase();
+          if (pt === 'ul' || pt === 'ol') depth++;
+          p = p.parentElement;
+        }
+        depth = Math.max(0, depth - 1);
+        ensureLineBreak();
+        appendText(LIST_MARKER_PREFIX + depth + '__');
+        visitChildren(el);
+        ensureLineBreak();
+        return;
+      }
+
+      if (tag === 'blockquote') {
+        ensureLineBreak();
+        var quoteText = normalizeWhitespace(el.innerText || '');
+        if (quoteText) {
+          quoteText.split('\n').forEach(function(line) {
+            appendText('> ' + escapeMarkdownText(line));
+            ensureLineBreak();
+          });
+          ensureLineBreak();
+          return;
+        }
       }
 
       if (tag === 'pre') {
@@ -667,6 +878,167 @@ def monospace_font() -> QFont:
     return font
 
 
+def markdown_to_html(markdown_text: str) -> str:
+    """Render markdown to HTML using Qt so QLabel can display rich text consistently."""
+    doc = QTextDocument()
+    app_font = QApplication.font() if QApplication.instance() else QFont("Sans Serif", 10)
+    doc.setDefaultFont(app_font)
+    # Keep typography consistent across labels while preserving heading hierarchy.
+    doc.setDefaultStyleSheet(
+        """
+        body { color: #111827; font-size: 13px; line-height: 1.35; }
+        p { margin: 0 0 8px 0; }
+        h1 { font-size: 22px; margin: 10px 0 8px 0; font-weight: 700; }
+        h2 { font-size: 19px; margin: 10px 0 7px 0; font-weight: 700; }
+        h3 { font-size: 17px; margin: 8px 0 6px 0; font-weight: 700; }
+        h4 { font-size: 15px; margin: 8px 0 6px 0; font-weight: 700; }
+        h5 { font-size: 14px; margin: 6px 0 4px 0; font-weight: 700; }
+        h6 { font-size: 13px; margin: 6px 0 4px 0; font-weight: 700; }
+        ul, ol { margin: 4px 0 8px 20px; }
+        li { margin: 2px 0; }
+        blockquote { color: #374151; border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; }
+        a { color: #1d4ed8; text-decoration: none; }
+        code { font-family: "DejaVu Sans Mono"; }
+        """
+    )
+    try:
+        doc.setMarkdown(markdown_text or "")
+    except Exception:
+        doc.setPlainText(markdown_text or "")
+    return doc.toHtml()
+
+
+class MarkdownTextWidget(QTextBrowser):
+    """Read-only markdown renderer with auto height for message text parts."""
+
+    relayoutRequested = Signal()
+
+    def __init__(self, markdown_text: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setOpenExternalLinks(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setStyleSheet(
+            """
+            QTextBrowser {
+                background: transparent;
+                border: none;
+                color: #111827;
+                padding: 0;
+                margin: 0;
+            }
+            """
+        )
+
+        doc = self.document()
+        app_font = QApplication.font() if QApplication.instance() else QFont("Sans Serif", 10)
+        doc.setDefaultFont(app_font)
+        doc.setDefaultStyleSheet(
+            """
+            body { color: #111827; font-size: 13px; line-height: 1.35; }
+            p { margin: 0 0 8px 0; }
+            h1 { font-size: 22px; margin: 10px 0 8px 0; font-weight: 700; }
+            h2 { font-size: 19px; margin: 10px 0 7px 0; font-weight: 700; }
+            h3 { font-size: 17px; margin: 8px 0 6px 0; font-weight: 700; }
+            h4 { font-size: 15px; margin: 8px 0 6px 0; font-weight: 700; }
+            h5 { font-size: 14px; margin: 6px 0 4px 0; font-weight: 700; }
+            h6 { font-size: 13px; margin: 6px 0 4px 0; font-weight: 700; }
+            ul, ol { margin: 4px 0 8px 22px; }
+            li { margin: 2px 0; }
+            blockquote { color: #374151; border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; }
+            a { color: #1d4ed8; text-decoration: none; }
+            code { font-family: "DejaVu Sans Mono"; }
+            """
+        )
+        render_md = normalize_markdown_for_qt_render(markdown_text or "")
+        try:
+            self.setMarkdown(render_md)
+        except Exception:
+            self.setPlainText(render_md)
+        self._sync_height()
+        doc.contentsChanged.connect(self._on_contents_changed)
+
+    def _on_contents_changed(self) -> None:
+        self._sync_height()
+        self.relayoutRequested.emit()
+
+    def _sync_height(self) -> None:
+        self.document().setTextWidth(max(100, self.viewport().width()))
+        doc_h = self.document().size().height()
+        self.setMinimumHeight(int(doc_h) + 6)
+        self.setMaximumHeight(int(doc_h) + 12)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._sync_height()
+
+
+def preview_from_markdown(markdown_text: str) -> str:
+    text = markdown_text or ""
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[(.*?)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\n+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_markdown_for_qt_render(markdown_text: str) -> str:
+    """
+    Qt's markdown parser can misinterpret some ChatGPT-emitted patterns, especially:
+    - standalone bold subtitle lines becoming list items
+    - subsequent bullets rendered as progressively nested
+    This function rewrites those patterns only for UI rendering.
+    """
+    lines = (markdown_text or "").splitlines()
+    out: List[str] = []
+    i = 0
+
+    bullet_subtitle_re = re.compile(r"^\s*-\s+\*\*([^*][^*]{0,80}?)\*\*\s*$")
+    list_item_re = re.compile(r"^(\s*)-\s+.+$")
+
+    while i < len(lines):
+        line = lines[i]
+        m = bullet_subtitle_re.match(line)
+        if m:
+            title = m.group(1).strip()
+            # Look ahead for following list items. If present, this is almost certainly
+            # a parser artifact and should be a subtitle, not a bullet item.
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and list_item_re.match(lines[j]):
+                out.append(f"### {title}")
+                # De-indent one nesting level from the following contiguous list block.
+                k = j
+                while k < len(lines):
+                    cur = lines[k]
+                    if not cur.strip():
+                        out.append(cur)
+                        k += 1
+                        continue
+                    m_item = list_item_re.match(cur)
+                    if not m_item:
+                        break
+                    indent = m_item.group(1)
+                    if indent.startswith("    "):
+                        out.append(cur[4:])
+                    else:
+                        out.append(cur)
+                    k += 1
+                i = k
+                continue
+
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)
+
+
 @dataclass
 class MessagePart:
     type: str
@@ -690,7 +1062,7 @@ class Message:
         chunks: List[str] = []
         for part in self.parts:
             if part.type == "text" and part.text.strip():
-                chunks.append(part.text.strip())
+                chunks.append(preview_from_markdown(normalize_markdown_for_qt_render(part.text.strip())))
             elif part.type == "code" and part.code.strip():
                 lang = part.lang.strip()
                 head = f"[code:{lang}] " if lang else "[code] "
@@ -1009,11 +1381,9 @@ class MessageRowWidget(QFrame):
         if not msg.collapsed:
             for part in msg.parts:
                 if part.type == "text":
-                    label = QLabel(part.text)
-                    label.setWordWrap(True)
-                    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                    label.setStyleSheet("QLabel { color: #111827; line-height: 1.3; }")
-                    self.expanded_layout.addWidget(label)
+                    text_widget = MarkdownTextWidget(part.text)
+                    text_widget.relayoutRequested.connect(self._schedule_relayout)
+                    self.expanded_layout.addWidget(text_widget)
                 elif part.type == "code":
                     code_widget = CodeBlockWidget(part.code, part.lang)
                     code_widget.copyRequested.connect(self._copy_code_cb)
@@ -1039,6 +1409,7 @@ class MessageListPane(QWidget):
     browserLanguageChanged = Signal(str)
     resetSessionRequested = Signal()
     exportRequested = Signal(str)
+    exportDebugVisibleRequested = Signal()
 
     def __init__(self, model: MessageListModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1132,6 +1503,10 @@ class MessageListPane(QWidget):
         export_pdf = QAction("PDF (.pdf)", self)
         export_pdf.triggered.connect(lambda: self.exportRequested.emit("pdf"))
         export_menu.addAction(export_pdf)
+
+        debug_action = QAction("Debug blocco visibile (.txt)", self)
+        debug_action.triggered.connect(self.exportDebugVisibleRequested.emit)
+        settings_menu.addAction(debug_action)
 
         self.settings_btn.setMenu(settings_menu)
         header_row.addWidget(self.settings_btn, 0, Qt.AlignVCenter)
@@ -1343,6 +1718,7 @@ class MainWindow(QMainWindow):
         self.left_pane.browserLanguageChanged.connect(self._on_browser_language_changed)
         self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
         self.left_pane.exportRequested.connect(self._on_export_requested)
+        self.left_pane.exportDebugVisibleRequested.connect(self._on_export_debug_visible_requested)
 
         splitter = QSplitter(Qt.Horizontal)  # Horizontal splitter => left/right panes.
         splitter.addWidget(self.left_pane)
@@ -1603,6 +1979,89 @@ class MainWindow(QMainWindow):
             # Fallback for environments with limited markdown support.
             doc.setPlainText(markdown_text)
         doc.print(printer)
+
+    @Slot()
+    def _on_export_debug_visible_requested(self) -> None:
+        key = self.left_pane.top_visible_key()
+        if not key:
+            QMessageBox.information(self, "Debug export", "Nessun blocco visibile rilevato.")
+            return
+        row = self.model.row_for_key(key)
+        msg = self.model.message_at_row(row) if row >= 0 else None
+        if not msg:
+            QMessageBox.information(self, "Debug export", "Messaggio non trovato nel modello.")
+            return
+
+        default_name = f"chatgpt_mirror_debug_{key[:32].replace('/', '_')}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Esporta debug blocco visibile", default_name, "Text (*.txt)"
+        )
+        if not path:
+            return
+
+        # Build local debug payload first (available immediately).
+        text_parts_md = [p.text for p in msg.parts if p.type == "text" and p.text.strip()]
+        raw_md = "\n\n".join(text_parts_md).strip()
+        qt_md = normalize_markdown_for_qt_render(raw_md)
+        parts_json = json.dumps(
+            [
+                (
+                    {"type": "text", "text": p.text}
+                    if p.type == "text"
+                    else {"type": "code", "lang": p.lang, "code": p.code}
+                )
+                for p in msg.parts
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        js = (
+            "(function(){"
+            f"var key={json.dumps(key)};"
+            "var nodes=document.querySelectorAll('[data-cgm-message-key]');"
+            "for(var i=0;i<nodes.length;i++){"
+            " if(nodes[i].getAttribute('data-cgm-message-key')===String(key)){"
+            "  return nodes[i].outerHTML || '';"
+            " }"
+            "}"
+            "return '';"
+            "})();"
+        )
+
+        def _write_debug_file(dom_html: object) -> None:
+            dom_text = dom_html if isinstance(dom_html, str) else ""
+            if not dom_text:
+                dom_text = "[DOM non trovato nel WebView per questa key (possibile pruning o key mismatch)]"
+
+            body = "\n".join(
+                [
+                    "=== CHATGPT MIRROR DEBUG BLOCK ===",
+                    f"key: {msg.key}",
+                    f"role: {msg.role}",
+                    f"row: {row}",
+                    "",
+                    "=== RAW PARTS JSON ===",
+                    parts_json,
+                    "",
+                    "=== RAW MARKDOWN (estratto) ===",
+                    raw_md or "[vuoto]",
+                    "",
+                    "=== QT MARKDOWN (post-normalizzazione) ===",
+                    qt_md or "[vuoto]",
+                    "",
+                    "=== DOM OUTER HTML (WebView) ===",
+                    dom_text,
+                    "",
+                ]
+            )
+            try:
+                Path(path).write_text(body, encoding="utf-8")
+                QMessageBox.information(self, "Debug export", f"Salvato in:\n{path}")
+            except Exception as exc:
+                QMessageBox.critical(self, "Debug export", f"Errore salvataggio:\n{exc}")
+
+        self.web_view.page().runJavaScript(js, _write_debug_file)
 
 
 def main() -> int:
