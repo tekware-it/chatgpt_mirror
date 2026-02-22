@@ -38,7 +38,7 @@ from PySide6.QtCore import (
     Slot,
     QStandardPaths,
 )
-from PySide6.QtGui import QColor, QFont, QGuiApplication
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication
 from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument, QSyntaxHighlighter
 from PySide6.QtWidgets import (
     QApplication,
@@ -1945,6 +1945,8 @@ class MainWindow(QMainWindow):
             return
         if not self._web_to_native_sync_enabled:
             return
+        if self._cursor_is_over(self.left_pane.list_view.viewport()):
+            return
         if time.monotonic() < self._ignore_web_scroll_events_until:
             return
         key = str(evt.get("key") or "")
@@ -1958,8 +1960,18 @@ class MainWindow(QMainWindow):
         if idx.isValid():
             self.left_pane.list_view.scrollTo(idx, QListView.PositionAtBottom)
 
+    def _cursor_is_over(self, widget: QWidget) -> bool:
+        try:
+            gp = QCursor.pos()
+            lp = widget.mapFromGlobal(gp)
+            return widget.rect().contains(lp)
+        except Exception:
+            return False
+
     def _on_native_scroll_value_changed(self, _value: int) -> None:
         if not self._native_to_web_sync_enabled:
+            return
+        if self._cursor_is_over(self.web_view):
             return
         if time.monotonic() < self._suppress_native_scroll_until:
             return
