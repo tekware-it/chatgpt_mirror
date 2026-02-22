@@ -25,6 +25,7 @@ from PySide6.QtCore import (
     QAbstractListModel,
     QModelIndex,
     QObject,
+    QLocale,
     QPoint,
     QUrl,
     QSize,
@@ -35,23 +36,29 @@ from PySide6.QtCore import (
     QStandardPaths,
 )
 from PySide6.QtGui import QColor, QFont, QGuiApplication
+from PySide6.QtGui import QAction, QActionGroup, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListView,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QMenu,
     QSizePolicy,
     QSplitter,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtPrintSupport import QPrinter
 
 
 JS_INJECTOR = r"""
@@ -829,6 +836,9 @@ class MessageListModel(QAbstractListModel):
                 self._messages[key] = Message(key=key, role=role, parts=parts)
                 self.endInsertRows()
 
+    def messages_in_order(self) -> List[Message]:
+        return [self._messages[k] for k in self._order if k in self._messages]
+
 
 class CodeBlockWidget(QWidget):
     copyRequested = Signal(str)
@@ -1022,10 +1032,23 @@ class MessageRowWidget(QFrame):
 
 
 class MessageListPane(QWidget):
+    autoScrollChanged = Signal(bool)
+    webToNativeSyncChanged = Signal(bool)
+    nativeToWebSyncChanged = Signal(bool)
+    keepDomChanged = Signal(int)
+    browserLanguageChanged = Signal(str)
+    resetSessionRequested = Signal()
+    exportRequested = Signal(str)
+
     def __init__(self, model: MessageListModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.model = model
         self._widgets_by_key: Dict[str, MessageRowWidget] = {}
+        self._auto_scroll_enabled = True
+        self._web_to_native_sync_enabled = True
+        self._native_to_web_sync_enabled = True
+        self._keep_dom_count = 30
+        self._browser_language_mode = "system"
         self._build_ui()
         self._connect_model()
 
@@ -1034,9 +1057,90 @@ class MessageListPane(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
+
+        self.settings_btn = QToolButton()
+        self.settings_btn.setText("...")
+        self.settings_btn.setPopupMode(QToolButton.InstantPopup)
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.setToolTip("Settings")
+        self.settings_btn.setStyleSheet(
+            "QToolButton { background: #f8fafc; border: 1px solid #cbd5e1; "
+            "border-radius: 8px; padding: 2px 8px; font-weight: 700; }"
+            "QToolButton:hover { background: #eef2f7; }"
+        )
+
+        settings_menu = QMenu(self.settings_btn)
+        self.auto_scroll_action = QAction("Auto-scroll nuovi messaggi", self, checkable=True)
+        self.auto_scroll_action.setChecked(self._auto_scroll_enabled)
+        self.auto_scroll_action.toggled.connect(self.autoScrollChanged.emit)
+        settings_menu.addAction(self.auto_scroll_action)
+
+        self.web_to_native_action = QAction("Sync scroll Web -> Native", self, checkable=True)
+        self.web_to_native_action.setChecked(self._web_to_native_sync_enabled)
+        self.web_to_native_action.toggled.connect(self.webToNativeSyncChanged.emit)
+        settings_menu.addAction(self.web_to_native_action)
+
+        self.native_to_web_action = QAction("Sync scroll Native -> Web", self, checkable=True)
+        self.native_to_web_action.setChecked(self._native_to_web_sync_enabled)
+        self.native_to_web_action.toggled.connect(self.nativeToWebSyncChanged.emit)
+        settings_menu.addAction(self.native_to_web_action)
+
+        settings_menu.addSeparator()
+
+        keep_dom_menu = settings_menu.addMenu("KEEP_DOM (WebView)")
+        self.keep_dom_group = QActionGroup(self)
+        self.keep_dom_group.setExclusive(True)
+        for count in (30, 80, 150):
+            action = QAction(str(count), self, checkable=True)
+            action.setChecked(count == self._keep_dom_count)
+            action.triggered.connect(lambda checked=False, c=count: self.keepDomChanged.emit(c))
+            self.keep_dom_group.addAction(action)
+            keep_dom_menu.addAction(action)
+
+        browser_lang_menu = settings_menu.addMenu("Lingua browser")
+        self.browser_lang_group = QActionGroup(self)
+        self.browser_lang_group.setExclusive(True)
+
+        lang_system = QAction("Sistema", self, checkable=True)
+        lang_system.setChecked(self._browser_language_mode == "system")
+        lang_system.triggered.connect(lambda checked=False: self.browserLanguageChanged.emit("system"))
+        self.browser_lang_group.addAction(lang_system)
+        browser_lang_menu.addAction(lang_system)
+
+        lang_en = QAction("English", self, checkable=True)
+        lang_en.setChecked(self._browser_language_mode == "en")
+        lang_en.triggered.connect(lambda checked=False: self.browserLanguageChanged.emit("en"))
+        self.browser_lang_group.addAction(lang_en)
+        browser_lang_menu.addAction(lang_en)
+
+        settings_menu.addSeparator()
+
+        reset_action = QAction("Reset sessione", self)
+        reset_action.triggered.connect(self.resetSessionRequested.emit)
+        settings_menu.addAction(reset_action)
+
+        export_menu = settings_menu.addMenu("Esporta conversazione")
+        export_md = QAction("Markdown (.md)", self)
+        export_md.triggered.connect(lambda: self.exportRequested.emit("md"))
+        export_menu.addAction(export_md)
+        export_json = QAction("JSON (.json)", self)
+        export_json.triggered.connect(lambda: self.exportRequested.emit("json"))
+        export_menu.addAction(export_json)
+        export_pdf = QAction("PDF (.pdf)", self)
+        export_pdf.triggered.connect(lambda: self.exportRequested.emit("pdf"))
+        export_menu.addAction(export_pdf)
+
+        self.settings_btn.setMenu(settings_menu)
+        header_row.addWidget(self.settings_btn, 0, Qt.AlignVCenter)
+
         self.header = QLabel("Native Mirror")
         self.header.setStyleSheet("QLabel { font-size: 14px; font-weight: 700; color: #111827; }")
-        layout.addWidget(self.header)
+        header_row.addWidget(self.header, 0, Qt.AlignVCenter)
+        header_row.addStretch(1)
+        layout.addLayout(header_row)
 
         self.list_view = QListView()
         self.list_view.setModel(self.model)
@@ -1226,7 +1330,19 @@ class MainWindow(QMainWindow):
         self._native_scroll_sync_timer.timeout.connect(self._send_native_top_key_to_web)
         self._suppress_native_scroll_until = 0.0
         self._ignore_web_scroll_events_until = 0.0
+        self._auto_scroll_enabled = True
+        self._web_to_native_sync_enabled = True
+        self._native_to_web_sync_enabled = True
+        self._keep_dom_count = 30
+        self._profile_root = profile_root
         self.left_pane.list_view.verticalScrollBar().valueChanged.connect(self._on_native_scroll_value_changed)
+        self.left_pane.autoScrollChanged.connect(self._on_auto_scroll_changed)
+        self.left_pane.webToNativeSyncChanged.connect(self._on_web_to_native_sync_changed)
+        self.left_pane.nativeToWebSyncChanged.connect(self._on_native_to_web_sync_changed)
+        self.left_pane.keepDomChanged.connect(self._on_keep_dom_changed)
+        self.left_pane.browserLanguageChanged.connect(self._on_browser_language_changed)
+        self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
+        self.left_pane.exportRequested.connect(self._on_export_requested)
 
         splitter = QSplitter(Qt.Horizontal)  # Horizontal splitter => left/right panes.
         splitter.addWidget(self.left_pane)
@@ -1234,6 +1350,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([700, 900])
         self.setCentralWidget(splitter)
 
+        self._apply_browser_language_setting()
         self.web_view.setUrl(QUrl("https://chatgpt.com"))
 
     @Slot(bool)
@@ -1242,6 +1359,7 @@ class MainWindow(QMainWindow):
             return
         # Inject bootstrap + extractor after each page load/navigation.
         self.web_view.page().runJavaScript(JS_INJECTOR)
+        QTimer.singleShot(800, self._apply_keep_dom_setting_to_web)
 
     @Slot(str)
     def on_delta_received(self, json_string: str) -> None:
@@ -1253,7 +1371,7 @@ class MainWindow(QMainWindow):
             return
         self.model.apply_deltas(payload)
         # Scroll to latest when new messages arrive; avoid jerky behavior by doing it async.
-        if self.model.rowCount() > 0:
+        if self._auto_scroll_enabled and self.model.rowCount() > 0:
             QTimer.singleShot(0, self._scroll_to_bottom)
 
     @Slot(str)
@@ -1265,6 +1383,8 @@ class MainWindow(QMainWindow):
         if not isinstance(evt, dict):
             return
         if evt.get("type") != "scroll_top_key":
+            return
+        if not self._web_to_native_sync_enabled:
             return
         if time.monotonic() < self._ignore_web_scroll_events_until:
             return
@@ -1280,6 +1400,8 @@ class MainWindow(QMainWindow):
             self.left_pane.list_view.scrollTo(idx, QListView.PositionAtBottom)
 
     def _on_native_scroll_value_changed(self, _value: int) -> None:
+        if not self._native_to_web_sync_enabled:
+            return
         if time.monotonic() < self._suppress_native_scroll_until:
             return
         self._native_scroll_sync_timer.start(80)
@@ -1297,6 +1419,190 @@ class MainWindow(QMainWindow):
             "})();"
         )
         self.web_view.page().runJavaScript(script)
+
+    @Slot(bool)
+    def _on_auto_scroll_changed(self, enabled: bool) -> None:
+        self._auto_scroll_enabled = bool(enabled)
+
+    @Slot(bool)
+    def _on_web_to_native_sync_changed(self, enabled: bool) -> None:
+        self._web_to_native_sync_enabled = bool(enabled)
+
+    @Slot(bool)
+    def _on_native_to_web_sync_changed(self, enabled: bool) -> None:
+        self._native_to_web_sync_enabled = bool(enabled)
+
+    @Slot(int)
+    def _on_keep_dom_changed(self, count: int) -> None:
+        self._keep_dom_count = max(5, int(count))
+        self._apply_keep_dom_setting_to_web()
+
+    def _apply_keep_dom_setting_to_web(self) -> None:
+        script = (
+            "(function(){"
+            "if(window.__chatgptMirror){"
+            f"window.__chatgptMirror.keepDom={int(self._keep_dom_count)};"
+            "if(typeof window.__chatgptMirror.scanNow==='function'){window.__chatgptMirror.scanNow('keepdom_change');}"
+            "}"
+            "})();"
+        )
+        self.web_view.page().runJavaScript(script)
+
+    def _apply_browser_language_setting(self) -> None:
+        mode = getattr(self, "_browser_language_mode", "system")
+        if mode == "en":
+            accept_lang = "en-US,en;q=0.9"
+        else:
+            sys_locale = QLocale.system().bcp47Name() or "en-US"
+            base = sys_locale.split("-")[0] if "-" in sys_locale else sys_locale
+            accept_lang = f"{sys_locale},{base};q=0.9,en;q=0.7"
+        try:
+            self.web_profile.setHttpAcceptLanguage(accept_lang)
+        except Exception:
+            pass
+
+    @Slot(str)
+    def _on_browser_language_changed(self, mode: str) -> None:
+        mode = (mode or "system").strip().lower()
+        if mode not in {"system", "en"}:
+            mode = "system"
+        self._browser_language_mode = mode
+        self._apply_browser_language_setting()
+        # Reload so chatgpt.com can pick up the new Accept-Language header.
+        self.web_view.reload()
+
+    @Slot()
+    def _on_reset_session_requested(self) -> None:
+        result = QMessageBox.question(
+            self,
+            "Reset sessione",
+            (
+                "Vuoi cancellare cookie e cache del WebView e ricaricare chatgpt.com?\n\n"
+                "Nota: potresti dover rifare il login."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+
+        try:
+            self.web_profile.cookieStore().deleteAllCookies()
+        except Exception:
+            pass
+        try:
+            self.web_profile.clearHttpCache()
+        except Exception:
+            pass
+        try:
+            self.web_profile.clearAllVisitedLinks()
+        except Exception:
+            pass
+
+        # Best-effort cleanup for origin storage in the current page context.
+        self.web_view.page().runJavaScript(
+            """
+            (async function(){
+              try { localStorage.clear(); } catch(e) {}
+              try { sessionStorage.clear(); } catch(e) {}
+              try {
+                if (window.indexedDB && indexedDB.databases) {
+                  const dbs = await indexedDB.databases();
+                  for (const db of dbs) { if (db && db.name) indexedDB.deleteDatabase(db.name); }
+                }
+              } catch(e) {}
+              return true;
+            })();
+            """
+        )
+        self.web_view.setUrl(QUrl("https://chatgpt.com"))
+
+    @Slot(str)
+    def _on_export_requested(self, fmt: str) -> None:
+        messages = self.model.messages_in_order()
+        if not messages:
+            QMessageBox.information(self, "Esporta", "Nessun messaggio da esportare.")
+            return
+
+        fmt = fmt.lower().strip()
+        if fmt == "md":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Esporta Markdown", "chatgpt_mirror_export.md", "Markdown (*.md)"
+            )
+            if not path:
+                return
+            Path(path).write_text(self._conversation_as_markdown(messages), encoding="utf-8")
+            return
+
+        if fmt == "json":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Esporta JSON", "chatgpt_mirror_export.json", "JSON (*.json)"
+            )
+            if not path:
+                return
+            payload = []
+            for i, m in enumerate(messages, start=1):
+                payload.append(
+                    {
+                        "index": i,
+                        "key": m.key,
+                        "role": m.role,
+                        "parts": [
+                            (
+                                {"type": "text", "text": p.text}
+                                if p.type == "text"
+                                else {"type": "code", "lang": p.lang, "code": p.code}
+                            )
+                            for p in m.parts
+                        ],
+                    }
+                )
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return
+
+        if fmt == "pdf":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Esporta PDF", "chatgpt_mirror_export.pdf", "PDF (*.pdf)"
+            )
+            if not path:
+                return
+            self._export_pdf_from_markdown(self._conversation_as_markdown(messages), path)
+            return
+
+    def _conversation_as_markdown(self, messages: List[Message]) -> str:
+        lines: List[str] = ["# ChatGPT Mirror Export", ""]
+        for i, msg in enumerate(messages, start=1):
+            title = "You" if msg.role == "user" else "Assistant"
+            lines.append(f"## {i}. {title}")
+            lines.append("")
+            for part in msg.parts:
+                if part.type == "text":
+                    txt = part.text.strip()
+                    if txt:
+                        lines.append(txt)
+                        lines.append("")
+                elif part.type == "code":
+                    lang = (part.lang or "").strip()
+                    code = part.code.rstrip("\n")
+                    lines.append(f"```{lang}")
+                    lines.append(code)
+                    lines.append("```")
+                    lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _export_pdf_from_markdown(self, markdown_text: str, path: str) -> None:
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(path)
+
+        doc = QTextDocument(self)
+        # Render the PDF starting from Markdown so the export stays close to message structure.
+        try:
+            doc.setMarkdown(markdown_text)
+        except Exception:
+            # Fallback for environments with limited markdown support.
+            doc.setPlainText(markdown_text)
+        doc.print(printer)
 
 
 def main() -> int:
