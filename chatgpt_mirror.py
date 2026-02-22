@@ -38,7 +38,7 @@ from PySide6.QtCore import (
     QStandardPaths,
 )
 from PySide6.QtGui import QColor, QFont, QGuiApplication
-from PySide6.QtGui import QAction, QActionGroup, QTextDocument
+from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument, QSyntaxHighlighter
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -282,6 +282,34 @@ JS_INJECTOR = r"""
   }
 
   function bestEffortLang(preEl) {
+    function normalizeLangJs(v) {
+      v = (v || '').trim().toLowerCase();
+      var map = {
+        py: 'python',
+        python3: 'python',
+        shell: 'bash',
+        sh: 'bash',
+        zsh: 'bash',
+        shellscript: 'bash',
+        js: 'javascript',
+        ts: 'typescript',
+        yml: 'yaml'
+      };
+      return map[v] || v;
+    }
+
+    // ChatGPT code blocks often show language in the first header line inside <pre>.
+    try {
+      var preText = (preEl && (preEl.innerText || preEl.textContent) || '').replace(/\r\n/g, '\n');
+      var firstLine = (preText.split('\n')[0] || '').trim();
+      if (firstLine && firstLine.length <= 20 && /^[A-Za-z0-9_+#.-]+$/.test(firstLine)) {
+        var low0 = firstLine.toLowerCase();
+        if (!['copy', 'copia', 'copy code'].includes(low0)) {
+          return normalizeLangJs(low0);
+        }
+      }
+    } catch (e) {}
+
     var candidates = [];
     if (preEl.parentElement) candidates.push(preEl.parentElement);
     if (preEl.parentElement && preEl.parentElement.parentElement) candidates.push(preEl.parentElement.parentElement);
@@ -298,19 +326,19 @@ JS_INJECTOR = r"""
           var low = t.toLowerCase();
           if (['copy code', 'copy'].includes(low)) continue;
           if (low.includes('language')) continue;
-          return low;
+          return normalizeLangJs(low);
         }
       }
       var cls = (c.className || '').toString();
       var m = cls.match(/language-([a-zA-Z0-9_+-]+)/);
-      if (m) return m[1].toLowerCase();
+      if (m) return normalizeLangJs(m[1]);
     }
 
     var code = preEl.querySelector('code');
     if (code) {
       var className = code.className || '';
       var m2 = className.match(/language-([a-zA-Z0-9_+-]+)/);
-      if (m2) return m2[1].toLowerCase();
+      if (m2) return normalizeLangJs(m2[1]);
     }
     return '';
   }
@@ -921,6 +949,121 @@ def monospace_font() -> QFont:
     return font
 
 
+def normalize_code_lang(lang: str) -> str:
+    v = (lang or "").strip().lower()
+    aliases = {
+        "py": "python",
+        "python3": "python",
+        "shell": "bash",
+        "sh": "bash",
+        "zsh": "bash",
+        "shellscript": "bash",
+        "js": "javascript",
+        "ts": "typescript",
+        "yml": "yaml",
+    }
+    return aliases.get(v, v)
+
+
+class SimpleCodeHighlighter(QSyntaxHighlighter):
+    def __init__(self, document, lang: str) -> None:
+        super().__init__(document)
+        self.lang = normalize_code_lang(lang)
+        self._rules = []
+        self._comment_patterns = []
+        self._build_rules()
+
+    def _fmt(self, color: str, bold: bool = False, italic: bool = False) -> QTextCharFormat:
+        f = QTextCharFormat()
+        f.setForeground(QColor(color))
+        if bold:
+            f.setFontWeight(QFont.Bold)
+        if italic:
+            f.setFontItalic(True)
+        return f
+
+    def _add_keywords(self, keywords, fmt: QTextCharFormat) -> None:
+        for kw in keywords:
+            self._rules.append((re.compile(rf"\b{re.escape(kw)}\b"), fmt))
+
+    def _build_rules(self) -> None:
+        kw_fmt = self._fmt("#93c5fd", bold=True)
+        str_fmt = self._fmt("#86efac")
+        num_fmt = self._fmt("#fca5a5")
+        cmt_fmt = self._fmt("#94a3b8", italic=True)
+        fn_fmt = self._fmt("#fcd34d")
+        op_fmt = self._fmt("#c4b5fd")
+
+        common_string_patterns = [
+            re.compile(r'"(?:\\.|[^"\\])*"'),
+            re.compile(r"'(?:\\.|[^'\\])*'"),
+        ]
+        for p in common_string_patterns:
+            self._rules.append((p, str_fmt))
+
+        self._rules.append((re.compile(r"\b\d+(\.\d+)?\b"), num_fmt))
+
+        if self.lang in {"python"}:
+            self._add_keywords(
+                [
+                    "def", "class", "import", "from", "as", "return", "if", "elif", "else",
+                    "for", "while", "try", "except", "finally", "with", "async", "await",
+                    "pass", "break", "continue", "raise", "in", "is", "and", "or", "not",
+                    "None", "True", "False",
+                ],
+                kw_fmt,
+            )
+            self._rules.append((re.compile(r"\bdef\s+([A-Za-z_]\w*)"), fn_fmt))
+            self._rules.append((re.compile(r"\bclass\s+([A-Za-z_]\w*)"), fn_fmt))
+            self._comment_patterns = [re.compile(r"#.*$")]
+        elif self.lang in {"bash"}:
+            self._add_keywords(
+                [
+                    "if", "then", "else", "fi", "for", "in", "do", "done", "case", "esac",
+                    "while", "function", "local", "export", "return", "exit",
+                ],
+                kw_fmt,
+            )
+            self._rules.append((re.compile(r"\$[A-Za-z_]\w*"), op_fmt))
+            self._rules.append((re.compile(r"\$\{[^}]+\}"), op_fmt))
+            self._comment_patterns = [re.compile(r"#.*$")]
+        elif self.lang in {"javascript", "typescript"}:
+            self._add_keywords(
+                [
+                    "function", "return", "const", "let", "var", "if", "else", "for", "while",
+                    "switch", "case", "break", "continue", "try", "catch", "finally", "class",
+                    "extends", "new", "import", "from", "export", "default", "async", "await",
+                    "true", "false", "null", "undefined",
+                ],
+                kw_fmt,
+            )
+            self._comment_patterns = [re.compile(r"//.*$")]
+        elif self.lang in {"json"}:
+            self._rules.append((re.compile(r'"[^"]+"\s*:'), self._fmt("#7dd3fc")))
+            self._add_keywords(["true", "false", "null"], kw_fmt)
+        elif self.lang in {"yaml"}:
+            self._rules.append((re.compile(r"^[ \t-]*[A-Za-z0-9_.-]+\s*:"), self._fmt("#7dd3fc")))
+            self._comment_patterns = [re.compile(r"#.*$")]
+        else:
+            # Generic fallback
+            self._comment_patterns = [re.compile(r"#.*$"), re.compile(r"//.*$")]
+
+        # Operators/punctuation (light touch)
+        self._rules.append((re.compile(r"[-=+*/<>!|&]+"), op_fmt))
+
+        self._keyword_fmt = kw_fmt
+        self._comment_fmt = cmt_fmt
+
+    def highlightBlock(self, text: str) -> None:
+        for pattern, fmt in self._rules:
+            for m in pattern.finditer(text):
+                self.setFormat(m.start(), m.end() - m.start(), fmt)
+        for pattern in self._comment_patterns:
+            m = pattern.search(text)
+            if m:
+                self.setFormat(m.start(), len(text) - m.start(), self._comment_fmt)
+
+
 def markdown_to_html(markdown_text: str) -> str:
     """Render markdown to HTML using Qt so QLabel can display rich text consistently."""
     doc = QTextDocument()
@@ -1220,7 +1363,8 @@ class CodeBlockWidget(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
 
-        lang_label = QLabel(self.lang or "code")
+        norm_lang = normalize_code_lang(self.lang or "")
+        lang_label = QLabel(norm_lang or "code")
         lang_label.setStyleSheet(
             "QLabel { background: #e7edf6; color: #2d3748; padding: 2px 8px; "
             "border-radius: 9px; font-size: 11px; }"
@@ -1247,6 +1391,8 @@ class CodeBlockWidget(QWidget):
             "QPlainTextEdit { background: #0f172a; color: #e5e7eb; "
             "border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px; }"
         )
+        # Lightweight syntax highlighting based on extracted language label.
+        self._highlighter = SimpleCodeHighlighter(editor.document(), norm_lang)
 
         line_count = max(1, min(12, self.code.count("\n") + 1))
         fm = editor.fontMetrics()
