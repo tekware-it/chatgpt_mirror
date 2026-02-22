@@ -1919,7 +1919,7 @@ class MainWindow(QMainWindow):
         except Exception:
             # Fallback for environments with limited markdown support.
             doc.setPlainText(markdown_text)
-        doc.print(printer)
+        doc.print_(printer)
 
     @Slot()
     def _on_export_debug_visible_requested(self) -> None:
