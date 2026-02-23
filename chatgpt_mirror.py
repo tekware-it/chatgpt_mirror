@@ -15,8 +15,10 @@ Important constraints:
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sys
+import tempfile
 import time
 from html import escape as html_escape
 from pathlib import Path
@@ -26,6 +28,7 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
+    QEventLoop,
     QModelIndex,
     QObject,
     QLocale,
@@ -81,6 +84,7 @@ except Exception:
     TextLexer = None  # type: ignore[assignment]
 
 PDF_PYGMENTS_STYLE = "default"
+IMAGE_BYTES_CACHE: Dict[str, bytes] = {}
 
 
 def ensure_profile_root() -> Path:
@@ -1663,6 +1667,11 @@ class ImagePartWidget(QWidget):
             pass
         if not data:
             return
+        if self.image_url:
+            try:
+                IMAGE_BYTES_CACHE[self.image_url] = data
+            except Exception:
+                pass
         pix = QPixmap()
         if not pix.loadFromData(data):
             return
@@ -2083,6 +2092,7 @@ class MessageListPane(QWidget):
     resetSessionRequested = Signal()
     exportRequested = Signal(str)
     exportDebugVisibleRequested = Signal()
+    exportPdfImagesDebugRequested = Signal()
 
     def __init__(self, model: MessageListModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2208,6 +2218,10 @@ class MessageListPane(QWidget):
         debug_action = QAction("Debug blocco visibile (.txt)", self)
         debug_action.triggered.connect(self.exportDebugVisibleRequested.emit)
         settings_menu.addAction(debug_action)
+
+        pdf_img_debug_action = QAction("Debug PDF immagini (.txt)", self)
+        pdf_img_debug_action.triggered.connect(self.exportPdfImagesDebugRequested.emit)
+        settings_menu.addAction(pdf_img_debug_action)
 
         self.settings_btn.setMenu(settings_menu)
         header_row.addWidget(self.settings_btn, 0, Qt.AlignVCenter)
@@ -2482,6 +2496,7 @@ class MainWindow(QMainWindow):
         self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
         self.left_pane.exportRequested.connect(self._on_export_requested)
         self.left_pane.exportDebugVisibleRequested.connect(self._on_export_debug_visible_requested)
+        self.left_pane.exportPdfImagesDebugRequested.connect(self._on_export_pdf_images_debug_requested)
 
         splitter = QSplitter(Qt.Horizontal)  # Horizontal splitter => left/right panes.
         splitter.addWidget(self.left_pane)
@@ -2847,15 +2862,33 @@ class MainWindow(QMainWindow):
                     if src:
                         alt = (part.alt or "").strip()
                         lines.append(f"![{alt}]({src})" if alt else f"![]({src})")
+                        lines.append(
+                            f'<!-- cgm-thumb src="{src}" alt="{alt.replace(chr(34), "&quot;")}" -->'
+                        )
                         lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
     def _markdown_fragment_to_html(self, markdown_text: str) -> str:
+        marker_pattern = re.compile(
+            r'<!--\s*cgm-thumb\s+src="([^"]+)"(?:\s+alt="([^"]*)")?\s*-->',
+            flags=re.IGNORECASE,
+        )
+        md = markdown_text or ""
+        # Hidden markers stay invisible in markdown renderers, but we can materialize them for PDF HTML.
+        def _marker_repl(m: re.Match) -> str:
+            src = m.group(1) or ""
+            alt = (m.group(2) or "image")
+            pdf_src = self._pdf_local_thumb_url(src)
+            return (
+                f'\n\n<div class="image-part"><a href="{html_escape(src)}">{html_escape(alt)}</a><br>'
+                f'<img src="{html_escape(pdf_src)}" alt="{html_escape(alt)}" class="inline-image"></div>\n\n'
+            )
+        md = marker_pattern.sub(_marker_repl, md)
         doc = QTextDocument(self)
         try:
-            doc.setMarkdown(markdown_text or "")
+            doc.setMarkdown(md)
         except Exception:
-            doc.setPlainText(markdown_text or "")
+            doc.setPlainText(md)
         html = doc.toHtml()
         m = re.search(r"<body[^>]*>(.*)</body>", html, flags=re.IGNORECASE | re.DOTALL)
         return m.group(1) if m else html
@@ -2881,6 +2914,36 @@ class MainWindow(QMainWindow):
             f'<div class="code-wrap"><div class="code-head">{title}</div>'
             f'<pre class="codehilite"><code>{html_escape(code)}</code></pre></div>'
         )
+
+    def _pdf_local_thumb_url(self, src: str) -> str:
+        src = (src or "").strip()
+        if not src:
+            return src
+        data = IMAGE_BYTES_CACHE.get(src)
+        if not data:
+            print(f"[pdf-img] cache miss src={src}")
+            return src
+        try:
+            h = hashlib.sha1(src.encode("utf-8")).hexdigest()[:16]
+            cache_dir = Path(tempfile.gettempdir()) / "chatgpt_mirror_pdf_images"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            ext = ".img"
+            if data.startswith(b"\x89PNG"):
+                ext = ".png"
+            elif data[:3] == b"\xff\xd8\xff":
+                ext = ".jpg"
+            elif data[:6] in (b"GIF87a", b"GIF89a"):
+                ext = ".gif"
+            elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+                ext = ".webp"
+            fpath = cache_dir / f"{h}{ext}"
+            if (not fpath.exists()) or fpath.stat().st_size != len(data):
+                fpath.write_bytes(data)
+            print(f"[pdf-img] cache hit src={src} file={fpath} bytes={len(data)}")
+            return fpath.resolve().as_uri()
+        except Exception:
+            print(f"[pdf-img] cache hit but file write failed src={src}")
+            return src
 
     def _conversation_as_html_for_pdf(self, messages: List[Message]) -> str:
         pygments_css = ""
@@ -2911,9 +2974,10 @@ class MainWindow(QMainWindow):
                     src = (part.image_url or "").strip()
                     if src:
                         alt = html_escape((part.alt or "").strip() or "image")
+                        pdf_src = self._pdf_local_thumb_url(src)
                         blocks.append(
                             f'<div class="image-part"><a href="{html_escape(src)}">{alt}</a><br>'
-                            f'<img src="{html_escape(src)}" alt="{alt}" class="inline-image"></div>'
+                            f'<img src="{html_escape(pdf_src)}" alt="{alt}" class="inline-image"></div>'
                         )
             blocks.append("</section>")
 
@@ -2922,12 +2986,17 @@ class MainWindow(QMainWindow):
 <head>
   <meta charset="utf-8">
   <style>
+    @page {{
+      margin: 12mm;
+    }}
     body {{
       font-family: "DejaVu Sans", "Liberation Sans", "Noto Sans", "Ubuntu", sans-serif;
       color: #111827;
       font-size: 11pt;
       line-height: 1.38;
-      margin: 0;
+      /* QtWebEngine printToPdf can ignore @page margins on some builds:
+         keep an explicit body margin as a reliable fallback. */
+      margin: 12mm;
     }}
     h1,h2,h3,h4,h5,h6 {{ color: #111827; }}
     p {{ margin: 0 0 8px 0; }}
@@ -3018,18 +3087,81 @@ class MainWindow(QMainWindow):
         doc.print_(printer)
 
     def _export_pdf_from_messages(self, messages: List[Message], path: str) -> None:
+        html = self._conversation_as_html_for_pdf(messages)
+
+        # Prefer WebEngine's PDF renderer: much better support for HTML/CSS/images than QTextDocument/QPrinter.
+        try:
+            tmp_dir = Path(tempfile.gettempdir()) / "chatgpt_mirror_pdf_render"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            html_path = tmp_dir / f"export_{int(time.time() * 1000)}.html"
+            html_path.write_text(html, encoding="utf-8")
+
+            page = QWebEnginePage(self.web_profile, self)
+            loop = QEventLoop(self)
+            state = {"loaded": False, "printed": False, "ok": False}
+            timeout = QTimer(self)
+            timeout.setSingleShot(True)
+
+            def _finish_loop():
+                if loop.isRunning():
+                    loop.quit()
+
+            def _on_timeout():
+                print("[pdf-export] timeout during WebEngine printToPdf, falling back")
+                _finish_loop()
+
+            def _on_load(ok: bool):
+                state["loaded"] = True
+                if not ok:
+                    print("[pdf-export] WebEngine load failed, falling back")
+                    _finish_loop()
+                    return
+                try:
+                    if hasattr(page, "pdfPrintingFinished"):
+                        page.pdfPrintingFinished.connect(_on_pdf_finished)  # type: ignore[attr-defined]
+                    page.printToPdf(path)
+                except Exception as exc:
+                    print(f"[pdf-export] printToPdf start failed: {exc}")
+                    _finish_loop()
+
+            def _on_pdf_finished(file_path: str, success: bool):
+                state["printed"] = True
+                state["ok"] = bool(success)
+                print(f"[pdf-export] pdfPrintingFinished success={success} path={file_path}")
+                _finish_loop()
+
+            page.loadFinished.connect(_on_load)
+            timeout.timeout.connect(_on_timeout)
+            timeout.start(20000)
+            page.load(QUrl.fromLocalFile(str(html_path)))
+            loop.exec()
+            timeout.stop()
+            try:
+                page.deleteLater()
+            except Exception:
+                pass
+            # Cleanup temp HTML file lazily.
+            try:
+                html_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            if state.get("printed") and state.get("ok") and Path(path).exists() and Path(path).stat().st_size > 0:
+                return
+        except Exception as exc:
+            print(f"[pdf-export] WebEngine PDF export failed, falling back: {exc}")
+
+        # Fallback: QTextDocument/QPrinter (less reliable for images, but still exports text/code).
         printer = QPrinter(QPrinter.HighResolution)
         printer.setOutputFormat(QPrinter.PdfFormat)
         printer.setOutputFileName(path)
-        # Real page margins for printed PDF (more reliable than CSS body margins in Qt rich text).
         try:
             printer.setPageMargins(12, 12, 12, 12, QPrinter.Millimeter)
         except Exception:
             pass
-
         doc = QTextDocument(self)
         doc.setDefaultFont(QApplication.font())
-        doc.setHtml(self._conversation_as_html_for_pdf(messages))
+        doc.setHtml(html)
         doc.print_(printer)
 
     @Slot()
@@ -3122,6 +3254,76 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Debug export", f"Errore salvataggio:\n{exc}")
 
         self.web_view.page().runJavaScript(js, _write_debug_file)
+
+    @Slot()
+    def _on_export_pdf_images_debug_requested(self) -> None:
+        key = self.left_pane.top_visible_key()
+        if not key:
+            QMessageBox.information(self, "Debug PDF immagini", "Nessun blocco visibile rilevato.")
+            return
+        row = self.model.row_for_key(key)
+        msg = self.model.message_at_row(row) if row >= 0 else None
+        if not msg:
+            QMessageBox.information(self, "Debug PDF immagini", "Messaggio non trovato nel modello.")
+            return
+
+        image_parts = [p for p in msg.parts if p.type == "image" and (p.image_url or "").strip()]
+        if not image_parts:
+            QMessageBox.information(self, "Debug PDF immagini", "Nessuna immagine nel messaggio visibile.")
+            return
+
+        base_name = self._default_export_basename()
+        default_name = f"{base_name}__pdf_images_debug_{key[:24].replace('/', '_')}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Debug PDF immagini", default_name, "Text (*.txt)"
+        )
+        if not path:
+            return
+
+        lines: List[str] = []
+        lines.append("=== CHATGPT MIRROR PDF IMAGE DEBUG ===")
+        lines.append(f"key: {key}")
+        lines.append(f"row: {row}")
+        lines.append("")
+        for i, p in enumerate(image_parts, start=1):
+            src = (p.image_url or "").strip()
+            alt = (p.alt or "").strip()
+            cache_data = IMAGE_BYTES_CACHE.get(src)
+            cache_hit = cache_data is not None
+            local_ref = self._pdf_local_thumb_url(src)
+            local_path = ""
+            exists = False
+            size = 0
+            if local_ref.startswith("file://"):
+                try:
+                    local_path = QUrl(local_ref).toLocalFile()
+                    fp = Path(local_path)
+                    exists = fp.exists()
+                    size = fp.stat().st_size if exists else 0
+                except Exception:
+                    pass
+            lines.extend(
+                [
+                    f"[{i}] src={src}",
+                    f"    alt={alt}",
+                    f"    cache_hit={cache_hit}",
+                    f"    cache_bytes={(len(cache_data) if cache_data else 0)}",
+                    f"    pdf_ref={local_ref}",
+                    f"    local_exists={exists}",
+                    f"    local_size={size}",
+                    "",
+                ]
+            )
+
+        html_snippet = self._conversation_as_html_for_pdf([msg])
+        lines.append("=== HTML SNIPPET ===")
+        lines.append(html_snippet[:12000])
+        lines.append("")
+        try:
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+            QMessageBox.information(self, "Debug PDF immagini", f"Salvato in:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Debug PDF immagini", f"Errore salvataggio:\n{exc}")
 
 
 class TabbedMainWindow(QMainWindow):
