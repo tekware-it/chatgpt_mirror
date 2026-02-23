@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import json
 import hashlib
+import sqlite3
 import re
 import sys
 import tempfile
 import time
+import uuid
 from html import escape as html_escape
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -97,6 +99,180 @@ def ensure_profile_root() -> Path:
     (profile_root / "qtwebengine").mkdir(parents=True, exist_ok=True)
     (profile_root / "qtwebengine-cache").mkdir(parents=True, exist_ok=True)
     return profile_root
+
+
+def ensure_data_root() -> Path:
+    root = Path(__file__).resolve().parent / "data"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "tabs").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+class OfflineStore:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.tabs_dir = root / "tabs"
+        self.manifest_path = root / "tabs.json"
+        self.tabs_dir.mkdir(parents=True, exist_ok=True)
+
+    def db_path_for_tab(self, tab_id: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (tab_id or "").strip()) or "tab"
+        return self.tabs_dir / f"{safe}.sqlite"
+
+    def _connect(self, tab_id: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path_for_tab(tab_id)))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS page_state (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+              order_idx INTEGER NOT NULL,
+              msg_key TEXT PRIMARY KEY,
+              role TEXT NOT NULL,
+              parts_json TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              collapsed INTEGER NOT NULL DEFAULT 0,
+              updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image_cache (
+              url TEXT PRIMARY KEY,
+              data BLOB NOT NULL,
+              updated_at REAL NOT NULL
+            )
+            """
+        )
+        return conn
+
+    def save_manifest(self, payload: dict) -> None:
+        body = {
+            "version": 1,
+            "current_index": int(payload.get("current_index") or 0),
+            "tabs": payload.get("tabs") or [],
+            "saved_at": time.time(),
+        }
+        self.manifest_path.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_manifest(self) -> dict:
+        if not self.manifest_path.exists():
+            return {"version": 1, "current_index": 0, "tabs": []}
+        try:
+            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"version": 1, "current_index": 0, "tabs": []}
+        if not isinstance(data, dict):
+            return {"version": 1, "current_index": 0, "tabs": []}
+        tabs = data.get("tabs")
+        return {
+            "version": 1,
+            "current_index": int(data.get("current_index") or 0),
+            "tabs": tabs if isinstance(tabs, list) else [],
+        }
+
+    def save_tab_snapshot(self, tab_id: str, *, url: str, title: str, messages: List["Message"]) -> None:
+        now = time.time()
+        conn = self._connect(tab_id)
+        try:
+            with conn:
+                conn.execute("DELETE FROM page_state")
+                conn.executemany(
+                    "INSERT INTO page_state(key, value) VALUES(?, ?)",
+                    [("url", url or ""), ("title", title or ""), ("saved_at", str(now)), ("schema", "1")],
+                )
+
+                conn.execute("DELETE FROM messages")
+                msg_rows = []
+                image_urls: List[str] = []
+                seen_imgs = set()
+                for idx, m in enumerate(messages):
+                    parts_payload = []
+                    for p in m.parts:
+                        item = {"type": p.type}
+                        if p.type == "text":
+                            item["text"] = p.text
+                        elif p.type == "code":
+                            item["code"] = p.code
+                            item["lang"] = p.lang
+                        elif p.type == "image":
+                            item["src"] = p.image_url
+                            item["alt"] = p.alt
+                            item["kind"] = p.image_kind
+                            u = (p.image_url or "").strip()
+                            if u and u not in seen_imgs:
+                                seen_imgs.add(u)
+                                image_urls.append(u)
+                        parts_payload.append(item)
+                    parts_json = json.dumps(parts_payload, ensure_ascii=False, separators=(",", ":"))
+                    msg_rows.append(
+                        (
+                            idx,
+                            m.key,
+                            m.role,
+                            parts_json,
+                            hashlib.sha1((m.role + "\n" + parts_json).encode("utf-8")).hexdigest(),
+                            1 if m.collapsed else 0,
+                            now,
+                        )
+                    )
+                if msg_rows:
+                    conn.executemany(
+                        "INSERT INTO messages(order_idx, msg_key, role, parts_json, content_hash, collapsed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        msg_rows,
+                    )
+
+                conn.execute("DELETE FROM image_cache")
+                img_rows = []
+                for u in image_urls:
+                    data = IMAGE_BYTES_CACHE.get(u)
+                    if data:
+                        img_rows.append((u, sqlite3.Binary(data), now))
+                if img_rows:
+                    conn.executemany(
+                        "INSERT INTO image_cache(url, data, updated_at) VALUES (?, ?, ?)",
+                        img_rows,
+                    )
+        finally:
+            conn.close()
+
+    def load_tab_snapshot(self, tab_id: str) -> Optional[dict]:
+        db_path = self.db_path_for_tab(tab_id)
+        if not db_path.exists():
+            return None
+        conn = self._connect(tab_id)
+        try:
+            page = {k: v for k, v in conn.execute("SELECT key, value FROM page_state")}
+            messages = []
+            for row in conn.execute(
+                "SELECT order_idx, msg_key, role, parts_json, collapsed FROM messages ORDER BY order_idx ASC"
+            ):
+                _, msg_key, role, parts_json, collapsed = row
+                try:
+                    parts = json.loads(parts_json or "[]")
+                except Exception:
+                    parts = []
+                messages.append(
+                    {
+                        "key": str(msg_key or ""),
+                        "role": str(role or "assistant"),
+                        "parts": parts if isinstance(parts, list) else [],
+                        "collapsed": bool(collapsed),
+                    }
+                )
+            for url, data in conn.execute("SELECT url, data FROM image_cache"):
+                if isinstance(url, str) and data:
+                    try:
+                        IMAGE_BYTES_CACHE[url] = bytes(data)
+                    except Exception:
+                        pass
+            return {"page_state": page, "messages": messages}
+        finally:
+            conn.close()
 
 
 JS_INJECTOR = r"""
@@ -1696,6 +1872,14 @@ class ImagePartWidget(QWidget):
     def _start_load(self) -> None:
         if not self.image_url:
             return
+        cached = IMAGE_BYTES_CACHE.get(self.image_url)
+        if cached:
+            pix = QPixmap()
+            if pix.loadFromData(cached):
+                self._pixmap = pix
+                self._render_pixmap()
+                QTimer.singleShot(0, self.relayoutRequested.emit)
+                return
         try:
             req = QNetworkRequest(QUrl(self.image_url))
             self._reply = self._manager().get(req)
@@ -2556,10 +2740,15 @@ class MainWindow(QMainWindow):
         tabs_host: Optional[QWidget] = None,
         shared_profile: Optional[QWebEngineProfile] = None,
         profile_root: Optional[Path] = None,
+        offline_store: Optional[OfflineStore] = None,
+        tab_id: Optional[str] = None,
+        initial_snapshot: Optional[dict] = None,
         initial_url: Optional[str] = "https://chatgpt.com",
     ) -> None:
         super().__init__()
         self._tabs_host = tabs_host
+        self._offline_store = offline_store
+        self.tab_id = (tab_id or uuid.uuid4().hex[:12]).strip()
         self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
         self.resize(1600, 900)
 
@@ -2605,6 +2794,9 @@ class MainWindow(QMainWindow):
         self._restore_pruned_on_view_enabled = False
         self._scroll_sync_debug_enabled = False
         self._profile_root = profile_root
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setSingleShot(True)
+        self._persist_timer.timeout.connect(self._persist_offline_snapshot_now)
         self.left_pane.list_view.verticalScrollBar().valueChanged.connect(self._on_native_scroll_value_changed)
         self.left_pane.autoScrollChanged.connect(self._on_auto_scroll_changed)
         self.left_pane.webToNativeSyncChanged.connect(self._on_web_to_native_sync_changed)
@@ -2624,7 +2816,12 @@ class MainWindow(QMainWindow):
         splitter.setSizes([700, 900])
         self.setCentralWidget(splitter)
 
+        if initial_snapshot:
+            self._restore_offline_snapshot(initial_snapshot)
+
         self._apply_browser_language_setting()
+        self.web_view.urlChanged.connect(lambda _u: self._schedule_persist_offline_snapshot())
+        self.web_view.titleChanged.connect(lambda _t: self._schedule_persist_offline_snapshot())
         if initial_url:
             self.web_view.setUrl(QUrl(initial_url))
 
@@ -2662,9 +2859,84 @@ class MainWindow(QMainWindow):
         if not isinstance(payload, list):
             return
         self.model.apply_deltas(payload)
+        self._schedule_persist_offline_snapshot()
         # Scroll to latest when new messages arrive; avoid jerky behavior by doing it async.
         if self._auto_scroll_enabled and self.model.rowCount() > 0:
             QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _schedule_persist_offline_snapshot(self, delay_ms: int = 700) -> None:
+        if self._offline_store is None:
+            host = self._tabs_host
+            if host is not None and hasattr(host, "schedule_persist_all"):
+                try:
+                    host.schedule_persist_all()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            return
+        self._persist_timer.start(max(100, int(delay_ms)))
+        host = self._tabs_host
+        if host is not None and hasattr(host, "schedule_manifest_save"):
+            try:
+                host.schedule_manifest_save()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    def _persist_offline_snapshot_now(self) -> None:
+        if self._offline_store is None:
+            return
+        try:
+            url = self.web_view.url().toString()
+        except Exception:
+            url = ""
+        try:
+            title = self.web_view.title() or ""
+        except Exception:
+            title = ""
+        try:
+            messages = self.model.messages_in_order()
+            self._offline_store.save_tab_snapshot(self.tab_id, url=url, title=title, messages=messages)
+        except Exception:
+            pass
+
+    def _restore_offline_snapshot(self, snapshot: dict) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        payload = snapshot.get("messages")
+        if isinstance(payload, list) and payload:
+            try:
+                self.model.apply_deltas(payload)
+                # restore collapse state (not part of deltas contract)
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("key") or "").strip()
+                    if not key or not item.get("collapsed"):
+                        continue
+                    row = self.model.row_for_key(key)
+                    msg = self.model.message_at_row(row) if row >= 0 else None
+                    if msg:
+                        msg.collapsed = True
+                self.left_pane._refresh_indices_from(0)
+            except Exception:
+                pass
+
+    def offline_snapshot_url_guess(self) -> str:
+        try:
+            u = self.web_view.url().toString()
+        except Exception:
+            u = ""
+        if u:
+            return u
+        page_state = None
+        if self._offline_store is not None:
+            try:
+                snap = self._offline_store.load_tab_snapshot(self.tab_id)
+                page_state = (snap or {}).get("page_state") if isinstance(snap, dict) else None
+            except Exception:
+                page_state = None
+        if isinstance(page_state, dict):
+            return str(page_state.get("url") or "")
+        return ""
 
     @Slot(str)
     def on_web_event_received(self, json_string: str) -> None:
@@ -3497,6 +3769,8 @@ class TabbedMainWindow(QMainWindow):
         self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
         self.resize(1600, 900)
         self._profile_root = ensure_profile_root()
+        self._data_root = ensure_data_root()
+        self._offline_store = OfflineStore(self._data_root)
         self.web_profile = QWebEngineProfile("chatgpt_mirror_profile", self)
         self.web_profile.setPersistentStoragePath(str(self._profile_root / "qtwebengine"))
         self.web_profile.setCachePath(str(self._profile_root / "qtwebengine-cache"))
@@ -3507,26 +3781,46 @@ class TabbedMainWindow(QMainWindow):
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.tabs.currentChanged.connect(lambda _i: self.schedule_manifest_save())
         self.setCentralWidget(self.tabs)
+        self._manifest_save_timer = QTimer(self)
+        self._manifest_save_timer.setSingleShot(True)
+        self._manifest_save_timer.timeout.connect(self._save_manifest_now)
+        self._snapshot_save_timer = QTimer(self)
+        self._snapshot_save_timer.setSingleShot(True)
+        self._snapshot_save_timer.timeout.connect(self._persist_all_tabs_now)
 
-        self.create_mirror_tab(url="https://chatgpt.com", switch=True)
+        self._restore_tabs_from_disk()
+        if self.tabs.count() == 0:
+            self.create_mirror_tab(url="https://chatgpt.com", switch=True)
 
-    def create_mirror_tab(self, url: Optional[str] = "https://chatgpt.com", switch: bool = True) -> Optional[MainWindow]:
+    def create_mirror_tab(
+        self,
+        url: Optional[str] = "https://chatgpt.com",
+        switch: bool = True,
+        tab_id: Optional[str] = None,
+        initial_snapshot: Optional[dict] = None,
+    ) -> Optional[MainWindow]:
         pane = MainWindow(
             tabs_host=self,
             shared_profile=self.web_profile,
             profile_root=self._profile_root,
+            offline_store=self._offline_store,
+            tab_id=tab_id,
+            initial_snapshot=initial_snapshot,
             initial_url=url,
         )
         idx = self.tabs.addTab(pane, "Nuovo tab")
         try:
             pane.web_view.titleChanged.connect(lambda title, p=pane: self._update_tab_title_for_pane(p, title))
             pane.web_view.urlChanged.connect(lambda _u, p=pane: self._update_tab_title_for_pane(p, pane.web_view.title()))
+            pane.web_view.urlChanged.connect(lambda _u: self.schedule_manifest_save())
         except Exception:
             pass
         self._update_tab_title_for_pane(pane, pane.web_view.title())
         if switch:
             self.tabs.setCurrentIndex(idx)
+        self.schedule_manifest_save()
         return pane
 
     def _pane_tab_index(self, pane: MainWindow) -> int:
@@ -3559,9 +3853,90 @@ class TabbedMainWindow(QMainWindow):
         if self.tabs.count() <= 1:
             return
         w = self.tabs.widget(index)
+        if isinstance(w, MainWindow):
+            try:
+                w._persist_offline_snapshot_now()
+            except Exception:
+                pass
         self.tabs.removeTab(index)
         if w is not None:
             w.deleteLater()
+        self.schedule_manifest_save()
+
+    def schedule_manifest_save(self, delay_ms: int = 300) -> None:
+        self._manifest_save_timer.start(max(100, int(delay_ms)))
+
+    def schedule_persist_all(self, delay_ms: int = 900) -> None:
+        self._snapshot_save_timer.start(max(250, int(delay_ms)))
+        self.schedule_manifest_save()
+
+    def _save_manifest_now(self) -> None:
+        tabs_payload = []
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if not isinstance(pane, MainWindow):
+                continue
+            try:
+                url = pane.web_view.url().toString() or pane.offline_snapshot_url_guess()
+            except Exception:
+                url = ""
+            tabs_payload.append({"tab_id": pane.tab_id, "url": url})
+        try:
+            self._offline_store.save_manifest(
+                {"current_index": max(0, self.tabs.currentIndex()), "tabs": tabs_payload}
+            )
+        except Exception:
+            pass
+
+    def _persist_all_tabs_now(self) -> None:
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if isinstance(pane, MainWindow):
+                try:
+                    pane._persist_offline_snapshot_now()
+                except Exception:
+                    pass
+
+    def _restore_tabs_from_disk(self) -> None:
+        try:
+            manifest = self._offline_store.load_manifest()
+        except Exception:
+            manifest = {"tabs": [], "current_index": 0}
+        tabs = manifest.get("tabs") or []
+        restored = 0
+        for item in tabs:
+            if not isinstance(item, dict):
+                continue
+            tab_id = str(item.get("tab_id") or "").strip()
+            if not tab_id:
+                continue
+            snapshot = None
+            try:
+                snapshot = self._offline_store.load_tab_snapshot(tab_id)
+            except Exception:
+                snapshot = None
+            page_state = (snapshot or {}).get("page_state") if isinstance(snapshot, dict) else {}
+            url = str((page_state or {}).get("url") or item.get("url") or "https://chatgpt.com")
+            if not url:
+                url = "https://chatgpt.com"
+            pane = self.create_mirror_tab(url=url, switch=False, tab_id=tab_id, initial_snapshot=snapshot)
+            if pane is not None:
+                restored += 1
+        if restored:
+            try:
+                idx = int(manifest.get("current_index") or 0)
+            except Exception:
+                idx = 0
+            idx = max(0, min(idx, self.tabs.count() - 1))
+            self.tabs.setCurrentIndex(idx)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            self._persist_all_tabs_now()
+            self._save_manifest_now()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 def main() -> int:
