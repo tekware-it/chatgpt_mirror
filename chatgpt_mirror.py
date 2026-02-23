@@ -860,6 +860,7 @@ JS_INJECTOR = r"""
     state.maxPrunedCache = 120;
     state.restorePinnedUntilByKey = new Map();
     state.restorePinMs = 15000;
+    state.scrollSyncDebug = false;
     state.pending = false;
     state.lastScanAt = 0;
     state.lastTopKeySent = '';
@@ -894,6 +895,9 @@ JS_INJECTOR = r"""
       if (!key) return;
       if (key === state.lastTopKeySent) return;
       state.lastTopKeySent = key;
+      if (state.scrollSyncDebug) {
+        sendEvent({ type: 'scroll_debug', dir: 'web->native', stage: 'emit_top_key', key: key, reason: reason || 'web_scroll' });
+      }
       sendEvent({ type: 'scroll_top_key', key: key, reason: reason || 'web_scroll' });
     }
 
@@ -942,8 +946,17 @@ JS_INJECTOR = r"""
           break;
         }
       }
-      if (!node) return false;
+      if (!node) {
+        if (state.scrollSyncDebug) {
+          sendEvent({ type: 'scroll_debug', dir: 'native->web', stage: 'scroll_to_key', targetKey: String(key), found: false });
+        }
+        return false;
+      }
       state.programmaticScrollUntil = Date.now() + 400;
+      var isPlaceholder = false;
+      try { isPlaceholder = node.matches && node.matches('[data-cgm-pruned-placeholder="1"]'); } catch (e) {}
+      var topKeyBefore = '';
+      try { topKeyBefore = getTopVisibleKey() || ''; } catch (e) {}
       var scroller = getScrollContainer(node);
       if (scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement) {
         var top = node.getBoundingClientRect().top + (window.scrollY || window.pageYOffset || 0);
@@ -952,6 +965,20 @@ JS_INJECTOR = r"""
         var scRect = scroller.getBoundingClientRect();
         var target = node.getBoundingClientRect().top - scRect.top + scroller.scrollTop - 8;
         scroller.scrollTop = Math.max(0, target);
+      }
+      if (state.scrollSyncDebug) {
+        var topKeyAfter = '';
+        try { topKeyAfter = getTopVisibleKey() || ''; } catch (e) {}
+        sendEvent({
+          type: 'scroll_debug',
+          dir: 'native->web',
+          stage: 'scroll_to_key',
+          targetKey: String(key),
+          found: true,
+          placeholder: !!isPlaceholder,
+          topKeyBefore: topKeyBefore,
+          topKeyAfter: topKeyAfter
+        });
       }
       setTimeout(function() { emitTopKeyIfChanged('programmatic'); }, 120);
       return true;
@@ -1632,6 +1659,7 @@ class MessageListPane(QWidget):
     nativeToWebSyncChanged = Signal(bool)
     keepDomChanged = Signal(int)
     restorePrunedOnViewChanged = Signal(bool)
+    scrollSyncDebugChanged = Signal(bool)
     browserLanguageChanged = Signal(str)
     resetSessionRequested = Signal()
     exportRequested = Signal(str)
@@ -1646,6 +1674,7 @@ class MessageListPane(QWidget):
         self._native_to_web_sync_enabled = True
         self._keep_dom_count = 30
         self._restore_pruned_on_view = False
+        self._scroll_sync_debug_enabled = False
         self._browser_language_mode = "system"
         self._build_ui()
         self._connect_model()
@@ -1702,6 +1731,11 @@ class MessageListPane(QWidget):
         restore_pruned_action.setChecked(self._restore_pruned_on_view)
         restore_pruned_action.toggled.connect(self.restorePrunedOnViewChanged.emit)
         settings_menu.addAction(restore_pruned_action)
+
+        scroll_sync_debug_action = QAction("Debug scroll sync (log)", self, checkable=True)
+        scroll_sync_debug_action.setChecked(self._scroll_sync_debug_enabled)
+        scroll_sync_debug_action.toggled.connect(self.scrollSyncDebugChanged.emit)
+        settings_menu.addAction(scroll_sync_debug_action)
 
         browser_lang_menu = settings_menu.addMenu("Lingua browser")
         self.browser_lang_group = QActionGroup(self)
@@ -1965,6 +1999,7 @@ class MainWindow(QMainWindow):
         self._native_to_web_sync_enabled = True
         self._keep_dom_count = 30
         self._restore_pruned_on_view_enabled = False
+        self._scroll_sync_debug_enabled = False
         self._profile_root = profile_root
         self.left_pane.list_view.verticalScrollBar().valueChanged.connect(self._on_native_scroll_value_changed)
         self.left_pane.autoScrollChanged.connect(self._on_auto_scroll_changed)
@@ -1972,6 +2007,7 @@ class MainWindow(QMainWindow):
         self.left_pane.nativeToWebSyncChanged.connect(self._on_native_to_web_sync_changed)
         self.left_pane.keepDomChanged.connect(self._on_keep_dom_changed)
         self.left_pane.restorePrunedOnViewChanged.connect(self._on_restore_pruned_on_view_changed)
+        self.left_pane.scrollSyncDebugChanged.connect(self._on_scroll_sync_debug_changed)
         self.left_pane.browserLanguageChanged.connect(self._on_browser_language_changed)
         self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
         self.left_pane.exportRequested.connect(self._on_export_requested)
@@ -1994,6 +2030,7 @@ class MainWindow(QMainWindow):
         self.web_view.page().runJavaScript(JS_INJECTOR)
         QTimer.singleShot(800, self._apply_keep_dom_setting_to_web)
         QTimer.singleShot(900, self._apply_restore_pruned_on_view_setting_to_web)
+        QTimer.singleShot(1000, self._apply_scroll_sync_debug_setting_to_web)
 
     @Slot(str)
     def on_delta_received(self, json_string: str) -> None:
@@ -2016,6 +2053,10 @@ class MainWindow(QMainWindow):
             return
         if not isinstance(evt, dict):
             return
+        if evt.get("type") == "scroll_debug":
+            if self._scroll_sync_debug_enabled:
+                print(f"[scroll-sync] {json.dumps(evt, ensure_ascii=False)}")
+            return
         if evt.get("type") != "scroll_top_key":
             return
         if not self._web_to_native_sync_enabled:
@@ -2028,7 +2069,10 @@ class MainWindow(QMainWindow):
         if not key:
             return
         self._suppress_native_scroll_until = time.monotonic() + 0.35
-        self.left_pane.scroll_key_to_top(key)
+        ok = self.left_pane.scroll_key_to_top(key)
+        if self._scroll_sync_debug_enabled:
+            reason = str(evt.get("reason") or "")
+            print(f"[scroll-sync] web->native key={key} reason={reason or '-'} ok={ok}")
 
     def _scroll_to_bottom(self) -> None:
         idx = self.model.index(max(0, self.model.rowCount() - 1), 0)
@@ -2056,6 +2100,8 @@ class MainWindow(QMainWindow):
         key = self.left_pane.top_visible_key()
         if not key:
             return
+        if self._scroll_sync_debug_enabled:
+            print(f"[scroll-sync] native->web request key={key}")
         self._ignore_web_scroll_events_until = time.monotonic() + 0.45
         script = (
             "(function(){"
@@ -2106,6 +2152,22 @@ class MainWindow(QMainWindow):
             "if(window.__chatgptMirror){"
             f"window.__chatgptMirror.restorePrunedOnView={enabled_js};"
             "if(typeof window.__chatgptMirror.scanNow==='function'){window.__chatgptMirror.scanNow('restore_pruned_toggle');}"
+            "}"
+            "})();"
+        )
+        self.web_view.page().runJavaScript(script)
+
+    @Slot(bool)
+    def _on_scroll_sync_debug_changed(self, enabled: bool) -> None:
+        self._scroll_sync_debug_enabled = bool(enabled)
+        self._apply_scroll_sync_debug_setting_to_web()
+
+    def _apply_scroll_sync_debug_setting_to_web(self) -> None:
+        enabled_js = "true" if self._scroll_sync_debug_enabled else "false"
+        script = (
+            "(function(){"
+            "if(window.__chatgptMirror){"
+            f"window.__chatgptMirror.scrollSyncDebug={enabled_js};"
             "}"
             "})();"
         )
