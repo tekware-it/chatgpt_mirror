@@ -1215,6 +1215,7 @@ class MarkdownTextWidget(QTextBrowser):
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFocusPolicy(Qt.NoFocus)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet(
             """
@@ -1264,10 +1265,24 @@ class MarkdownTextWidget(QTextBrowser):
         doc_h = self.document().size().height()
         self.setMinimumHeight(int(doc_h) + 6)
         self.setMaximumHeight(int(doc_h) + 12)
+        try:
+            self.verticalScrollBar().setValue(0)
+            self.horizontalScrollBar().setValue(0)
+        except Exception:
+            pass
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._sync_height()
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        # Text parts must not scroll internally; let the outer message list consume the wheel.
+        try:
+            self.verticalScrollBar().setValue(0)
+            self.horizontalScrollBar().setValue(0)
+        except Exception:
+            pass
+        event.ignore()
 
 
 def preview_from_markdown(markdown_text: str) -> str:
@@ -1454,6 +1469,30 @@ class MessageListModel(QAbstractListModel):
         return [self._messages[k] for k in self._order if k in self._messages]
 
 
+class CodePlainTextEdit(QPlainTextEdit):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._lock_vertical_wheel = False
+
+    def set_vertical_wheel_locked(self, locked: bool) -> None:
+        self._lock_vertical_wheel = bool(locked)
+        if self._lock_vertical_wheel:
+            try:
+                self.verticalScrollBar().setValue(0)
+            except Exception:
+                pass
+
+    def wheelEvent(self, event):  # type: ignore[override]
+        if self._lock_vertical_wheel:
+            try:
+                self.verticalScrollBar().setValue(0)
+            except Exception:
+                pass
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
+
 class CodeBlockWidget(QWidget):
     copyRequested = Signal(str)
     relayoutRequested = Signal()
@@ -1505,7 +1544,7 @@ class CodeBlockWidget(QWidget):
 
         outer.addLayout(header)
 
-        editor = QPlainTextEdit()
+        editor = CodePlainTextEdit()
         editor.setReadOnly(True)
         editor.setPlainText(self.code)
         editor.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -1565,20 +1604,25 @@ class CodeBlockWidget(QWidget):
         if self._display_mode == "full":
             visible_lines = total_lines
             editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            editor.set_vertical_wheel_locked(True)
+            try:
+                editor.verticalScrollBar().setValue(0)
+            except Exception:
+                pass
         elif self._collapsed and self._is_long_block:
             visible_lines = self._collapsed_lines
             editor.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            editor.set_vertical_wheel_locked(False)
         else:
             visible_lines = min(total_lines, self._expanded_lines_cap)
             editor.setVerticalScrollBarPolicy(
                 Qt.ScrollBarAsNeeded if total_lines > self._expanded_lines_cap else Qt.ScrollBarAlwaysOff
             )
+            editor.set_vertical_wheel_locked(False)
         fm = editor.fontMetrics()
         height = max(60, (fm.lineSpacing() * visible_lines) + 24)
         editor.setMinimumHeight(height)
         editor.setMaximumHeight(height)
-
-
 class MessageRowWidget(QFrame):
     relayoutRequested = Signal(str, QSize)
 
