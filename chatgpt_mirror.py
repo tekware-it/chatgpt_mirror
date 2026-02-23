@@ -3079,7 +3079,6 @@ class MainWindow(QMainWindow):
             return src
         data = IMAGE_BYTES_CACHE.get(src)
         if not data:
-            print(f"[pdf-img] cache miss src={src}")
             return src
         try:
             h = hashlib.sha1(src.encode("utf-8")).hexdigest()[:16]
@@ -3097,10 +3096,8 @@ class MainWindow(QMainWindow):
             fpath = cache_dir / f"{h}{ext}"
             if (not fpath.exists()) or fpath.stat().st_size != len(data):
                 fpath.write_bytes(data)
-            print(f"[pdf-img] cache hit src={src} file={fpath} bytes={len(data)}")
             return fpath.resolve().as_uri()
         except Exception:
-            print(f"[pdf-img] cache hit but file write failed src={src}")
             return src
 
     def _conversation_as_html_for_pdf(self, messages: List[Message]) -> str:
@@ -3268,13 +3265,11 @@ class MainWindow(QMainWindow):
                     loop.quit()
 
             def _on_timeout():
-                print("[pdf-export] timeout during WebEngine printToPdf, falling back")
                 _finish_loop()
 
             def _on_load(ok: bool):
                 state["loaded"] = True
                 if not ok:
-                    print("[pdf-export] WebEngine load failed, falling back")
                     _finish_loop()
                     return
                 try:
@@ -3288,13 +3283,11 @@ class MainWindow(QMainWindow):
                     )
                     page.printToPdf(path, layout)
                 except Exception as exc:
-                    print(f"[pdf-export] printToPdf start failed: {exc}")
                     _finish_loop()
 
             def _on_pdf_finished(file_path: str, success: bool):
                 state["printed"] = True
                 state["ok"] = bool(success)
-                print(f"[pdf-export] pdfPrintingFinished success={success} path={file_path}")
                 _finish_loop()
 
             page.loadFinished.connect(_on_load)
@@ -3316,7 +3309,7 @@ class MainWindow(QMainWindow):
             if state.get("printed") and state.get("ok") and Path(path).exists() and Path(path).stat().st_size > 0:
                 return
         except Exception as exc:
-            print(f"[pdf-export] WebEngine PDF export failed, falling back: {exc}")
+            _ = exc
 
         # Fallback: QTextDocument/QPrinter (less reliable for images, but still exports text/code).
         printer = QPrinter(QPrinter.HighResolution)
