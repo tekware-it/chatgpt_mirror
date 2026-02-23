@@ -38,7 +38,7 @@ from PySide6.QtCore import (
     Slot,
     QStandardPaths,
 )
-from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPixmap
 from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument, QSyntaxHighlighter
 from PySide6.QtWidgets import (
     QApplication,
@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtPrintSupport import QPrinter
@@ -488,6 +489,33 @@ JS_INJECTOR = r"""
       };
     }
 
+    function imagePartFromImg(imgEl) {
+      if (!(imgEl instanceof Element)) return null;
+      // Images embedded inside inline rich-entity text (often inside <strong> in list items)
+      // break markdown markers if extracted as standalone parts. Skip them for now.
+      var inlineAnc = imgEl.closest && imgEl.closest('strong, b, em, i, a, li, p');
+      if (inlineAnc) return null;
+      var src = (imgEl.currentSrc || imgEl.getAttribute('src') || '').trim();
+      if (!src) return null;
+      if (/^data:image\//i.test(src) && src.length > 2_000_000) return null;
+      if (imgEl.closest && imgEl.closest('[data-testid*="webpage-citation-pill"]')) return null;
+      if (imgEl.closest && imgEl.closest('button,[role="button"]')) return null;
+      var cls = classStr(imgEl);
+      if (cls.includes('icon-sm') || cls.includes('favicon')) return null;
+      var host = '';
+      try { host = (new URL(src, location.href)).hostname.toLowerCase(); } catch (e) { host = ''; }
+      if (host.includes('google.com') && src.includes('/favicons?')) return null;
+      var w = Number(imgEl.getAttribute('width') || imgEl.width || 0);
+      var h = Number(imgEl.getAttribute('height') || imgEl.height || 0);
+      var inRichEntityImage = !!(imgEl.closest && imgEl.closest('[data-rich-entity-image="true"]'));
+      if (!inRichEntityImage && w > 0 && h > 0 && w <= 48 && h <= 48) return null;
+      return {
+        type: 'image',
+        src: src,
+        alt: (imgEl.getAttribute('alt') || '').trim()
+      };
+    }
+
     function ensureLineBreak() {
       if (!textBuf.endsWith('\n')) textBuf += '\n';
     }
@@ -526,6 +554,15 @@ JS_INJECTOR = r"""
 
       if (tag === 'br') {
         appendText('\n');
+        return;
+      }
+
+      if (tag === 'img') {
+        var imgPart = imagePartFromImg(el);
+        if (imgPart) {
+          flushText();
+          parts.push(imgPart);
+        }
         return;
       }
 
@@ -1314,6 +1351,8 @@ class MessagePart:
     text: str = ""
     code: str = ""
     lang: str = ""
+    image_url: str = ""
+    alt: str = ""
 
 
 @dataclass
@@ -1336,6 +1375,8 @@ class Message:
                 lang = part.lang.strip()
                 head = f"[code:{lang}] " if lang else "[code] "
                 chunks.append(head + part.code.strip().splitlines()[0])
+            elif part.type == "image" and part.image_url.strip():
+                chunks.append("[image] " + (part.alt.strip() or part.image_url.strip()))
         text = " ".join(chunks).strip()
         if len(text) <= limit:
             return text
@@ -1352,6 +1393,11 @@ class Message:
                 code = part.code.rstrip("\n")
                 lang = (part.lang or "").strip()
                 out.append(f"```{lang}\n{code}\n```")
+            elif part.type == "image":
+                url = (part.image_url or "").strip()
+                if url:
+                    alt = (part.alt or "").strip()
+                    out.append(f"![{alt}]({url})" if alt else f"![]({url})")
         return "\n\n".join(out).strip()
 
 
@@ -1459,6 +1505,16 @@ class MessageListModel(QAbstractListModel):
                                 lang=str(item.get("lang") or ""),
                             )
                         )
+                elif ptype == "image":
+                    src = str(item.get("src") or item.get("url") or "").strip()
+                    if src:
+                        parts.append(
+                            MessagePart(
+                                type="image",
+                                image_url=src,
+                                alt=str(item.get("alt") or ""),
+                            )
+                        )
             if not parts:
                 continue
 
@@ -1503,6 +1559,115 @@ class CodePlainTextEdit(QPlainTextEdit):
             event.ignore()
             return
         super().wheelEvent(event)
+
+
+class ImagePartWidget(QWidget):
+    copyRequested = Signal(str)
+    relayoutRequested = Signal()
+
+    _net_mgr: Optional[QNetworkAccessManager] = None
+
+    def __init__(self, image_url: str, alt: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.image_url = (image_url or "").strip()
+        self.alt = (alt or "").strip()
+        self._pixmap: Optional[QPixmap] = None
+        self._reply = None
+        self._build_ui()
+        self._start_load()
+
+    @classmethod
+    def _manager(cls) -> QNetworkAccessManager:
+        if cls._net_mgr is None:
+            cls._net_mgr = QNetworkAccessManager()
+        return cls._net_mgr
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 2, 0, 2)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+        chip = QLabel("image")
+        chip.setStyleSheet(
+            "QLabel { background: #e7edf6; color: #2d3748; padding: 2px 8px; border-radius: 9px; font-size: 11px; }"
+        )
+        top.addWidget(chip)
+        top.addStretch(1)
+        copy_btn = QPushButton("Copy image URL")
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.clicked.connect(lambda: self.copyRequested.emit(self.image_url))
+        top.addWidget(copy_btn)
+        outer.addLayout(top)
+
+        self.preview = QLabel(self.alt or "Image")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumHeight(80)
+        self.preview.setMaximumHeight(220)
+        self.preview.setStyleSheet(
+            "QLabel { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; color: #475569; }"
+        )
+        self.preview.setWordWrap(True)
+        outer.addWidget(self.preview)
+
+        self.url_label = QLabel(self.image_url)
+        self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.url_label.setWordWrap(True)
+        self.url_label.setStyleSheet("QLabel { color: #334155; font-size: 12px; }")
+        outer.addWidget(self.url_label)
+
+    def _start_load(self) -> None:
+        if not self.image_url:
+            return
+        try:
+            req = QNetworkRequest(QUrl(self.image_url))
+            self._reply = self._manager().get(req)
+            self._reply.finished.connect(self._on_reply_finished)
+        except Exception:
+            self._reply = None
+
+    def _on_reply_finished(self) -> None:
+        reply = self._reply
+        self._reply = None
+        if reply is None:
+            return
+        try:
+            data = bytes(reply.readAll())
+        except Exception:
+            data = b""
+        try:
+            reply.deleteLater()
+        except Exception:
+            pass
+        if not data:
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(data):
+            return
+        self._pixmap = pix
+        self._render_pixmap()
+        self.relayoutRequested.emit()
+
+    def _render_pixmap(self) -> None:
+        if self._pixmap is None:
+            return
+        target_w = max(120, min(320, self.width() - 4))
+        scaled = self._pixmap.scaledToWidth(target_w, Qt.SmoothTransformation)
+        if scaled.height() > 220:
+            scaled = self._pixmap.scaled(target_w, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview.setPixmap(scaled)
+        self.preview.setMinimumHeight(max(80, scaled.height() + 8))
+        self.preview.setMaximumHeight(max(90, scaled.height() + 8))
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._pixmap is not None:
+            self._render_pixmap()
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
 
 
 class CodeFullTextWidget(QTextBrowser):
@@ -1863,6 +2028,11 @@ class MessageRowWidget(QFrame):
                     code_widget.copyRequested.connect(self._copy_code_cb)
                     code_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(code_widget)
+                elif part.type == "image":
+                    img_widget = ImagePartWidget(part.image_url, part.alt)
+                    img_widget.copyRequested.connect(self._copy_code_cb)
+                    img_widget.relayoutRequested.connect(self._schedule_relayout)
+                    self.expanded_layout.addWidget(img_widget)
             self.expanded_layout.addStretch(0)
 
         self._schedule_relayout()
@@ -2573,7 +2743,11 @@ class MainWindow(QMainWindow):
                             (
                                 {"type": "text", "text": p.text}
                                 if p.type == "text"
-                                else {"type": "code", "lang": p.lang, "code": p.code}
+                                else (
+                                    {"type": "code", "lang": p.lang, "code": p.code}
+                                    if p.type == "code"
+                                    else {"type": "image", "src": p.image_url, "alt": p.alt}
+                                )
                             )
                             for p in m.parts
                         ],
@@ -2648,6 +2822,12 @@ class MainWindow(QMainWindow):
                     lines.append(code)
                     lines.append("```")
                     lines.append("")
+                elif part.type == "image":
+                    src = (part.image_url or "").strip()
+                    if src:
+                        alt = (part.alt or "").strip()
+                        lines.append(f"![{alt}]({src})" if alt else f"![]({src})")
+                        lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
     def _markdown_fragment_to_html(self, markdown_text: str) -> str:
@@ -2707,6 +2887,14 @@ class MainWindow(QMainWindow):
                         blocks.append(f'<div class="text-part">{self._markdown_fragment_to_html(txt)}</div>')
                 elif part.type == "code":
                     blocks.append(self._code_html_for_pdf(part.code, part.lang))
+                elif part.type == "image":
+                    src = (part.image_url or "").strip()
+                    if src:
+                        alt = html_escape((part.alt or "").strip() or "image")
+                        blocks.append(
+                            f'<div class="image-part"><a href="{html_escape(src)}">{alt}</a><br>'
+                            f'<img src="{html_escape(src)}" alt="{alt}" class="inline-image"></div>'
+                        )
             blocks.append("</section>")
 
         return f"""<!doctype html>
@@ -2739,6 +2927,18 @@ class MainWindow(QMainWindow):
     .msg.user .msg-head {{ color: #065f46; }}
     .msg.assistant .msg-head {{ color: #1e3a8a; }}
     .text-part {{ margin-bottom: 6px; }}
+    .image-part {{
+      margin: 5pt 0 8pt 0;
+      border: 1px solid #dbe2ea;
+      border-radius: 8px;
+      padding: 5pt;
+      page-break-inside: avoid;
+    }}
+    .inline-image {{
+      max-width: 280pt;
+      max-height: 180pt;
+      margin-top: 4pt;
+    }}
     .code-wrap {{
       border: 1px solid #cbd5e1;
       border-radius: 8px;
@@ -2844,7 +3044,11 @@ class MainWindow(QMainWindow):
                 (
                     {"type": "text", "text": p.text}
                     if p.type == "text"
-                    else {"type": "code", "lang": p.lang, "code": p.code}
+                    else (
+                        {"type": "code", "lang": p.lang, "code": p.code}
+                        if p.type == "code"
+                        else {"type": "image", "src": p.image_url, "alt": p.alt}
+                    )
                 )
                 for p in msg.parts
             ],
