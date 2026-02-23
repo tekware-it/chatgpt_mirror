@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QTextBrowser,
     QToolButton,
     QVBoxLayout,
@@ -79,6 +80,17 @@ except Exception:
     TextLexer = None  # type: ignore[assignment]
 
 PDF_PYGMENTS_STYLE = "default"
+
+
+def ensure_profile_root() -> Path:
+    app_data_root = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+    if not app_data_root:
+        app_data_root = str(Path.home() / ".local" / "share" / "chatgpt_mirror")
+    profile_root = Path(app_data_root)
+    profile_root.mkdir(parents=True, exist_ok=True)
+    (profile_root / "qtwebengine").mkdir(parents=True, exist_ok=True)
+    (profile_root / "qtwebengine-cache").mkdir(parents=True, exist_ok=True)
+    return profile_root
 
 
 JS_INJECTOR = r"""
@@ -2190,6 +2202,20 @@ class MirrorWebPage(QWebEnginePage):
     CONSOLE_DELTA_PREFIX = "__CGM_DELTA__"
     CONSOLE_EVENT_PREFIX = "__CGM_EVT__"
 
+    def __init__(self, profile: QWebEngineProfile, parent: Optional[QObject] = None, new_page_factory=None) -> None:
+        super().__init__(profile, parent)
+        self._new_page_factory = new_page_factory
+
+    def createWindow(self, _type):  # type: ignore[override]
+        if callable(self._new_page_factory):
+            try:
+                page = self._new_page_factory()
+                if page is not None:
+                    return page
+            except Exception:
+                pass
+        return super().createWindow(_type)
+
     def javaScriptConsoleMessage(self, level, message, line_number, source_id) -> None:  # type: ignore[override]
         if isinstance(message, str) and message.startswith(self.CONSOLE_DELTA_PREFIX):
             self.consoleDeltaReceived.emit(message[len(self.CONSOLE_DELTA_PREFIX) :])
@@ -2201,8 +2227,15 @@ class MirrorWebPage(QWebEnginePage):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        tabs_host: Optional[QWidget] = None,
+        shared_profile: Optional[QWebEngineProfile] = None,
+        profile_root: Optional[Path] = None,
+        initial_url: Optional[str] = "https://chatgpt.com",
+    ) -> None:
         super().__init__()
+        self._tabs_host = tabs_host
         self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
         self.resize(1600, 900)
 
@@ -2211,20 +2244,18 @@ class MainWindow(QMainWindow):
         self.web_view = QWebEngineView()
 
         # Use a disk-backed WebEngine profile so chatgpt.com cookies/session survive app restarts.
-        app_data_root = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-        if not app_data_root:
-            app_data_root = str(Path.home() / ".local" / "share" / "chatgpt_mirror")
-        profile_root = Path(app_data_root)
-        profile_root.mkdir(parents=True, exist_ok=True)
-        (profile_root / "qtwebengine").mkdir(parents=True, exist_ok=True)
-        (profile_root / "qtwebengine-cache").mkdir(parents=True, exist_ok=True)
-
-        self.web_profile = QWebEngineProfile("chatgpt_mirror_profile", self)
-        self.web_profile.setPersistentStoragePath(str(profile_root / "qtwebengine"))
-        self.web_profile.setCachePath(str(profile_root / "qtwebengine-cache"))
-        self.web_profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
-        self.web_profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
-        self.web_page = MirrorWebPage(self.web_profile, self.web_view)
+        if shared_profile is None:
+            profile_root = ensure_profile_root()
+            self.web_profile = QWebEngineProfile("chatgpt_mirror_profile", self)
+            self.web_profile.setPersistentStoragePath(str(profile_root / "qtwebengine"))
+            self.web_profile.setCachePath(str(profile_root / "qtwebengine-cache"))
+            self.web_profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+            self.web_profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
+        else:
+            self.web_profile = shared_profile
+            if profile_root is None:
+                profile_root = ensure_profile_root()
+        self.web_page = MirrorWebPage(self.web_profile, self.web_view, new_page_factory=self._create_new_tab_page)
         self.web_view.setPage(self.web_page)
 
         self.bridge = WebBridge()
@@ -2269,7 +2300,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self._apply_browser_language_setting()
-        self.web_view.setUrl(QUrl("https://chatgpt.com"))
+        if initial_url:
+            self.web_view.setUrl(QUrl(initial_url))
+
+    def _create_new_tab_page(self):
+        host = self._tabs_host
+        if host is None:
+            return None
+        creator = getattr(host, "create_mirror_tab", None)
+        if not callable(creator):
+            return None
+        try:
+            new_tab = creator(url=None, switch=True)
+            if new_tab is None:
+                return None
+            return new_tab.web_view.page()
+        except Exception:
+            return None
 
     @Slot(bool)
     def on_load_finished(self, ok: bool) -> None:
@@ -2853,6 +2900,79 @@ class MainWindow(QMainWindow):
         self.web_view.page().runJavaScript(js, _write_debug_file)
 
 
+class TabbedMainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
+        self.resize(1600, 900)
+        self._profile_root = ensure_profile_root()
+        self.web_profile = QWebEngineProfile("chatgpt_mirror_profile", self)
+        self.web_profile.setPersistentStoragePath(str(self._profile_root / "qtwebengine"))
+        self.web_profile.setCachePath(str(self._profile_root / "qtwebengine-cache"))
+        self.web_profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+        self.web_profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.setCentralWidget(self.tabs)
+
+        self.create_mirror_tab(url="https://chatgpt.com", switch=True)
+
+    def create_mirror_tab(self, url: Optional[str] = "https://chatgpt.com", switch: bool = True) -> Optional[MainWindow]:
+        pane = MainWindow(
+            tabs_host=self,
+            shared_profile=self.web_profile,
+            profile_root=self._profile_root,
+            initial_url=url,
+        )
+        idx = self.tabs.addTab(pane, "Nuovo tab")
+        try:
+            pane.web_view.titleChanged.connect(lambda title, p=pane: self._update_tab_title_for_pane(p, title))
+            pane.web_view.urlChanged.connect(lambda _u, p=pane: self._update_tab_title_for_pane(p, pane.web_view.title()))
+        except Exception:
+            pass
+        self._update_tab_title_for_pane(pane, pane.web_view.title())
+        if switch:
+            self.tabs.setCurrentIndex(idx)
+        return pane
+
+    def _pane_tab_index(self, pane: MainWindow) -> int:
+        for i in range(self.tabs.count()):
+            if self.tabs.widget(i) is pane:
+                return i
+        return -1
+
+    def _update_tab_title_for_pane(self, pane: MainWindow, title: str) -> None:
+        idx = self._pane_tab_index(pane)
+        if idx < 0:
+            return
+        t = (title or "").strip()
+        if " - " in t:
+            left, right = t.rsplit(" - ", 1)
+            if right.strip().lower() == "chatgpt" and left.strip():
+                t = left.strip()
+        if not t:
+            try:
+                url = pane.web_view.url().toString()
+            except Exception:
+                url = ""
+            t = "ChatGPT" if "chatgpt.com" in url else "Nuovo tab"
+        if len(t) > 28:
+            t = t[:27].rstrip() + "…"
+        self.tabs.setTabText(idx, t)
+        self.tabs.setTabToolTip(idx, title or t)
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        if self.tabs.count() <= 1:
+            return
+        w = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        if w is not None:
+            w.deleteLater()
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("chatgpt_mirror")
@@ -2869,7 +2989,7 @@ def main() -> int:
         QPushButton:pressed { background: #e2e8f0; }
         """
     )
-    window = MainWindow()
+    window = TabbedMainWindow()
     window.show()
     return app.exec()
 
