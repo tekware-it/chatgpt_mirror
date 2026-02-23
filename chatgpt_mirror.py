@@ -15,6 +15,7 @@ Important constraints:
 from __future__ import annotations
 
 import json
+import base64
 import re
 import sys
 import time
@@ -22,6 +23,8 @@ from html import escape as html_escape
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+import urllib.request
+import urllib.error
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -516,6 +519,16 @@ JS_INJECTOR = r"""
       };
     }
 
+    function imagePartFromListItemRichEntity(liEl) {
+      if (!(liEl instanceof Element)) return null;
+      var rich = liEl.querySelector('[data-rich-entity-image="true"] img');
+      if (!(rich instanceof Element)) return null;
+      var src = (rich.currentSrc || rich.getAttribute('src') || '').trim();
+      if (!src) return null;
+      var alt = (rich.getAttribute('alt') || '').trim();
+      return { type: 'image', src: src, alt: alt };
+    }
+
     function ensureLineBreak() {
       if (!textBuf.endsWith('\n')) textBuf += '\n';
     }
@@ -655,6 +668,11 @@ JS_INJECTOR = r"""
           p = p.parentElement;
         }
         depth = Math.max(0, depth - 1);
+        var liImage = imagePartFromListItemRichEntity(el);
+        if (liImage) {
+          flushText();
+          parts.push(liImage);
+        }
         ensureLineBreak();
         appendText(LIST_MARKER_PREFIX + depth + '__');
         visitChildren(el);
@@ -694,6 +712,9 @@ JS_INJECTOR = r"""
       } else if (p.type === 'code') {
         var c = (p.code || '').replace(/\u00a0/g, ' ');
         if (c) cleaned.push({ type: 'code', lang: p.lang || '', code: c });
+      } else if (p.type === 'image') {
+        var srcI = (p.src || '').trim();
+        if (srcI) cleaned.push({ type: 'image', src: srcI, alt: (p.alt || '') });
       }
     }
 
@@ -1612,8 +1633,10 @@ class ImagePartWidget(QWidget):
         self.preview.setWordWrap(True)
         outer.addWidget(self.preview)
 
-        self.url_label = QLabel(self.image_url)
-        self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        link_html = f'<a href="{html_escape(self.image_url)}">{html_escape(self.image_url)}</a>'
+        self.url_label = QLabel(link_html)
+        self.url_label.setOpenExternalLinks(True)
+        self.url_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.url_label.setWordWrap(True)
         self.url_label.setStyleSheet("QLabel { color: #334155; font-size: 12px; }")
         outer.addWidget(self.url_label)
@@ -2862,6 +2885,49 @@ class MainWindow(QMainWindow):
             f'<pre class="codehilite"><code>{html_escape(code)}</code></pre></div>'
         )
 
+    def _image_src_for_pdf(self, src: str) -> str:
+        src = (src or "").strip()
+        if not src:
+            return src
+        if src.startswith("data:image/"):
+            return src
+        cache = getattr(self, "_pdf_image_data_uri_cache", None)
+        if cache is None:
+            cache = {}
+            self._pdf_image_data_uri_cache = cache
+        if src in cache:
+            return cache[src]
+        # Best-effort: embed remote image as data URI so QTextDocument PDF export can render it.
+        try:
+            req = urllib.request.Request(
+                src,
+                headers={"User-Agent": "chatgpt-mirror/1.0", "Accept": "image/*,*/*;q=0.8"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = resp.read()
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not data:
+                cache[src] = src
+                return src
+            if not ctype.startswith("image/"):
+                if data.startswith(b"\x89PNG"):
+                    ctype = "image/png"
+                elif data[:3] == b"\xff\xd8\xff":
+                    ctype = "image/jpeg"
+                elif data[:6] in (b"GIF87a", b"GIF89a"):
+                    ctype = "image/gif"
+                elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+                    ctype = "image/webp"
+                else:
+                    ctype = "image/png"
+            b64 = base64.b64encode(data).decode("ascii")
+            embedded = f"data:{ctype};base64,{b64}"
+            cache[src] = embedded
+            return embedded
+        except Exception:
+            cache[src] = src
+            return src
+
     def _conversation_as_html_for_pdf(self, messages: List[Message]) -> str:
         pygments_css = ""
         if PYGMENTS_AVAILABLE and HtmlFormatter:
@@ -2891,9 +2957,10 @@ class MainWindow(QMainWindow):
                     src = (part.image_url or "").strip()
                     if src:
                         alt = html_escape((part.alt or "").strip() or "image")
+                        pdf_src = self._image_src_for_pdf(src)
                         blocks.append(
                             f'<div class="image-part"><a href="{html_escape(src)}">{alt}</a><br>'
-                            f'<img src="{html_escape(src)}" alt="{alt}" class="inline-image"></div>'
+                            f'<img src="{html_escape(pdf_src)}" alt="{alt}" class="inline-image"></div>'
                         )
             blocks.append("</section>")
 
