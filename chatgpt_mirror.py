@@ -1456,11 +1456,19 @@ class MessageListModel(QAbstractListModel):
 
 class CodeBlockWidget(QWidget):
     copyRequested = Signal(str)
+    relayoutRequested = Signal()
 
-    def __init__(self, code: str, lang: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, code: str, lang: str, display_mode: str = "auto", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.code = code
         self.lang = lang
+        self._display_mode = (display_mode or "auto").strip().lower()
+        self._editor: Optional[QPlainTextEdit] = None
+        self._toggle_btn: Optional[QPushButton] = None
+        self._is_long_block = False
+        self._collapsed = True
+        self._collapsed_lines = 8
+        self._expanded_lines_cap = 24
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1486,6 +1494,15 @@ class CodeBlockWidget(QWidget):
         copy_btn.clicked.connect(lambda: self.copyRequested.emit(self.code))
         header.addWidget(copy_btn)
 
+        total_lines = max(1, self.code.count("\n") + 1)
+        self._is_long_block = total_lines > self._collapsed_lines
+        if self._is_long_block:
+            self._toggle_btn = QPushButton("Expand")
+            self._toggle_btn.setCursor(Qt.PointingHandCursor)
+            self._toggle_btn.clicked.connect(self._toggle_collapsed)
+            header.addWidget(self._toggle_btn)
+        self._apply_display_mode_defaults()
+
         outer.addLayout(header)
 
         editor = QPlainTextEdit()
@@ -1502,13 +1519,64 @@ class CodeBlockWidget(QWidget):
         )
         # Lightweight syntax highlighting based on extracted language label.
         self._highlighter = SimpleCodeHighlighter(editor.document(), norm_lang)
-
-        line_count = max(1, min(12, self.code.count("\n") + 1))
-        fm = editor.fontMetrics()
-        height = (fm.lineSpacing() * line_count) + 24
-        editor.setMinimumHeight(height)
-        editor.setMaximumHeight(max(height, 60))
+        self._editor = editor
+        self._apply_editor_height()
         outer.addWidget(editor)
+
+    def _apply_display_mode_defaults(self) -> None:
+        mode = self._display_mode
+        if mode == "full":
+            self._collapsed = False
+        elif mode == "expanded":
+            self._collapsed = False
+        else:
+            self._collapsed = self._is_long_block
+        if self._toggle_btn is not None:
+            self._toggle_btn.setVisible(mode != "full" and self._is_long_block)
+            self._toggle_btn.setText("Expand" if self._collapsed else "Collapse")
+
+    def set_display_mode(self, mode: str) -> None:
+        mode = (mode or "auto").strip().lower()
+        if mode not in {"auto", "expanded", "full"}:
+            mode = "auto"
+        if mode == self._display_mode:
+            return
+        self._display_mode = mode
+        self._apply_display_mode_defaults()
+        self._apply_editor_height()
+        QTimer.singleShot(0, self.relayoutRequested.emit)
+
+    def _toggle_collapsed(self) -> None:
+        if not self._is_long_block:
+            return
+        if self._display_mode == "full":
+            return
+        self._collapsed = not self._collapsed
+        if self._toggle_btn is not None:
+            self._toggle_btn.setText("Expand" if self._collapsed else "Collapse")
+        self._apply_editor_height()
+        QTimer.singleShot(0, self.relayoutRequested.emit)
+
+    def _apply_editor_height(self) -> None:
+        if self._editor is None:
+            return
+        editor = self._editor
+        total_lines = max(1, self.code.count("\n") + 1)
+        if self._display_mode == "full":
+            visible_lines = total_lines
+            editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        elif self._collapsed and self._is_long_block:
+            visible_lines = self._collapsed_lines
+            editor.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        else:
+            visible_lines = min(total_lines, self._expanded_lines_cap)
+            editor.setVerticalScrollBarPolicy(
+                Qt.ScrollBarAsNeeded if total_lines > self._expanded_lines_cap else Qt.ScrollBarAlwaysOff
+            )
+        fm = editor.fontMetrics()
+        height = max(60, (fm.lineSpacing() * visible_lines) + 24)
+        editor.setMinimumHeight(height)
+        editor.setMaximumHeight(height)
 
 
 class MessageRowWidget(QFrame):
@@ -1520,6 +1588,7 @@ class MessageRowWidget(QFrame):
         copy_message_cb,
         toggle_collapse_cb,
         copy_code_cb,
+        code_block_display_mode: str = "auto",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -1527,6 +1596,7 @@ class MessageRowWidget(QFrame):
         self._copy_message_cb = copy_message_cb
         self._toggle_collapse_cb = toggle_collapse_cb
         self._copy_code_cb = copy_code_cb
+        self._code_block_display_mode = (code_block_display_mode or "auto").strip().lower()
         self._message: Optional[Message] = None
         self._index_display = 0
         self._last_emitted_size_hint: Optional[QSize] = None
@@ -1604,6 +1674,16 @@ class MessageRowWidget(QFrame):
         self._index_display = display_index
         self._render()
 
+    def set_code_block_display_mode(self, mode: str) -> None:
+        mode = (mode or "auto").strip().lower()
+        if mode not in {"auto", "expanded", "full"}:
+            mode = "auto"
+        if mode == self._code_block_display_mode:
+            return
+        self._code_block_display_mode = mode
+        if self._message is not None:
+            self._render()
+
     def _render(self) -> None:
         if self._message is None:
             return
@@ -1631,8 +1711,9 @@ class MessageRowWidget(QFrame):
                     text_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(text_widget)
                 elif part.type == "code":
-                    code_widget = CodeBlockWidget(part.code, part.lang)
+                    code_widget = CodeBlockWidget(part.code, part.lang, self._code_block_display_mode)
                     code_widget.copyRequested.connect(self._copy_code_cb)
+                    code_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(code_widget)
             self.expanded_layout.addStretch(0)
 
@@ -1675,6 +1756,7 @@ class MessageListPane(QWidget):
         self._keep_dom_count = 30
         self._restore_pruned_on_view = False
         self._scroll_sync_debug_enabled = False
+        self._code_block_display_mode = "auto"
         self._browser_language_mode = "system"
         self._build_ui()
         self._connect_model()
@@ -1726,6 +1808,21 @@ class MessageListPane(QWidget):
             action.triggered.connect(lambda checked=False, c=count: self.keepDomChanged.emit(c))
             self.keep_dom_group.addAction(action)
             keep_dom_menu.addAction(action)
+
+        code_block_menu = settings_menu.addMenu("Blocchi codice (Native)")
+        self.code_block_mode_group = QActionGroup(self)
+        self.code_block_mode_group.setExclusive(True)
+        code_mode_specs = [
+            ("Auto (collassa lunghi)", "auto"),
+            ("Espansi", "expanded"),
+            ("Espansione totale", "full"),
+        ]
+        for label, mode in code_mode_specs:
+            action = QAction(label, self, checkable=True)
+            action.setChecked(mode == self._code_block_display_mode)
+            action.triggered.connect(lambda checked=False, m=mode: self._set_code_block_display_mode(m))
+            self.code_block_mode_group.addAction(action)
+            code_block_menu.addAction(action)
 
         restore_pruned_action = QAction("Consenti ripristino DOM pruned con doppio click", self, checkable=True)
         restore_pruned_action.setChecked(self._restore_pruned_on_view)
@@ -1846,6 +1943,7 @@ class MessageListPane(QWidget):
             copy_message_cb=self.copy_message,
             toggle_collapse_cb=self.model.toggle_collapsed,
             copy_code_cb=self.copy_code,
+            code_block_display_mode=self._code_block_display_mode,
         )
         widget.relayoutRequested.connect(self._on_row_relayout_requested)
         self._widgets_by_key[msg.key] = widget
@@ -1854,6 +1952,21 @@ class MessageListPane(QWidget):
         self.list_view.setIndexWidget(index, widget)
         self._apply_row_width(widget)
         widget.set_message(msg, row + 1)
+
+    def _set_code_block_display_mode(self, mode: str) -> None:
+        mode = (mode or "auto").strip().lower()
+        if mode not in {"auto", "expanded", "full"}:
+            mode = "auto"
+        if mode == self._code_block_display_mode:
+            return
+        self._code_block_display_mode = mode
+        for row in range(self.model.rowCount()):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            widget = self._widgets_by_key.get(msg.key)
+            if widget is not None:
+                widget.set_code_block_display_mode(mode)
 
     @Slot(str, QSize)
     def _on_row_relayout_requested(self, key: str, size_hint: QSize) -> None:
