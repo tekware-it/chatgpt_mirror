@@ -1493,6 +1493,71 @@ class CodePlainTextEdit(QPlainTextEdit):
         super().wheelEvent(event)
 
 
+class CodeFullTextWidget(QTextBrowser):
+    relayoutRequested = Signal()
+
+    def __init__(self, code: str, lang: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._code = code or ""
+        self._lang = normalize_code_lang(lang or "")
+        self.setReadOnly(True)
+        self.setOpenExternalLinks(False)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setLineWrapMode(QTextBrowser.WidgetWidth)
+        self.setStyleSheet(
+            """
+            QTextBrowser {
+                background: #0f172a;
+                color: #e5e7eb;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 8px;
+                margin: 0;
+            }
+            """
+        )
+        doc = self.document()
+        doc.setDefaultFont(monospace_font())
+        doc.setDocumentMargin(0)
+        self.setPlainText(self._code)
+        self._highlighter = SimpleCodeHighlighter(doc, self._lang)
+        self._sync_height()
+        doc.contentsChanged.connect(self._on_contents_changed)
+
+    def _on_contents_changed(self) -> None:
+        self._sync_height()
+        self.relayoutRequested.emit()
+
+    def _sync_height(self) -> None:
+        self.document().setTextWidth(max(100, self.viewport().width()))
+        doc_h = self.document().size().height()
+        # Extra bottom slack avoids clipping the descenders/last line in some Qt layouts.
+        height = int(doc_h) + 20
+        self.setMinimumHeight(max(60, height))
+        self.setMaximumHeight(max(60, height))
+        try:
+            self.verticalScrollBar().setValue(0)
+            self.horizontalScrollBar().setValue(0)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._sync_height()
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            self.verticalScrollBar().setValue(0)
+            self.horizontalScrollBar().setValue(0)
+        except Exception:
+            pass
+        event.ignore()
+
+
 class CodeBlockWidget(QWidget):
     copyRequested = Signal(str)
     relayoutRequested = Signal()
@@ -1503,6 +1568,7 @@ class CodeBlockWidget(QWidget):
         self.lang = lang
         self._display_mode = (display_mode or "auto").strip().lower()
         self._editor: Optional[QPlainTextEdit] = None
+        self._full_view: Optional[CodeFullTextWidget] = None
         self._toggle_btn: Optional[QPushButton] = None
         self._is_long_block = False
         self._collapsed = True
@@ -1559,8 +1625,14 @@ class CodeBlockWidget(QWidget):
         # Lightweight syntax highlighting based on extracted language label.
         self._highlighter = SimpleCodeHighlighter(editor.document(), norm_lang)
         self._editor = editor
-        self._apply_editor_height()
         outer.addWidget(editor)
+
+        full_view = CodeFullTextWidget(self.code, self.lang)
+        full_view.relayoutRequested.connect(self.relayoutRequested.emit)
+        self._full_view = full_view
+        outer.addWidget(full_view)
+
+        self._apply_editor_height()
 
     def _apply_display_mode_defaults(self) -> None:
         mode = self._display_mode
@@ -1600,16 +1672,15 @@ class CodeBlockWidget(QWidget):
         if self._editor is None:
             return
         editor = self._editor
+        if self._full_view is not None:
+            use_full = self._display_mode == "full"
+            self._full_view.setVisible(use_full)
+            editor.setVisible(not use_full)
+            if use_full:
+                self._full_view._sync_height()
+                return
         total_lines = max(1, self.code.count("\n") + 1)
-        if self._display_mode == "full":
-            visible_lines = total_lines
-            editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            editor.set_vertical_wheel_locked(True)
-            try:
-                editor.verticalScrollBar().setValue(0)
-            except Exception:
-                pass
-        elif self._collapsed and self._is_long_block:
+        if self._collapsed and self._is_long_block:
             visible_lines = self._collapsed_lines
             editor.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             editor.set_vertical_wheel_locked(False)
