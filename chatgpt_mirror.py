@@ -115,12 +115,65 @@ class OfflineStore:
         self.manifest_path = root / "tabs.json"
         self.tabs_dir.mkdir(parents=True, exist_ok=True)
 
-    def db_path_for_tab(self, tab_id: str) -> Path:
+    def _safe_db_stem(self, value: str) -> str:
+        v = re.sub(r"[^a-zA-Z0-9._ -]+", "_", (value or "").strip())
+        v = re.sub(r"\s+", " ", v).strip().strip(". ")
+        v = v.replace("/", "_")
+        if len(v) > 90:
+            v = v[:90].rstrip()
+        return v or "chatgpt"
+
+    def _normalize_db_file_name(self, db_file: str) -> str:
+        name = Path((db_file or "").strip()).name
+        if not name:
+            name = "tab.sqlite"
+        if not name.lower().endswith(".sqlite"):
+            name += ".sqlite"
+        return re.sub(r"[^a-zA-Z0-9._ -]+", "_", name)
+
+    def db_path_for_tab(self, tab_id: str, db_file: Optional[str] = None) -> Path:
+        if db_file:
+            return self.tabs_dir / self._normalize_db_file_name(db_file)
         safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", (tab_id or "").strip()) or "tab"
         return self.tabs_dir / f"{safe}.sqlite"
 
-    def _connect(self, tab_id: str) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path_for_tab(tab_id)))
+    def suggest_db_file_name(self, *, title: str, url: str, saved_at: Optional[float] = None) -> str:
+        ts = time.localtime(saved_at or time.time())
+        stamp = time.strftime("%Y%m%d-%H%M%S", ts)
+        raw_title = (title or "").strip()
+        if " - " in raw_title:
+            left, right = raw_title.rsplit(" - ", 1)
+            if right.strip().lower() == "chatgpt" and left.strip():
+                raw_title = left.strip()
+        if not raw_title or raw_title.lower() == "chatgpt":
+            raw_title = "chatgpt"
+            try:
+                q = QUrl(url or "")
+                if q.isValid() and q.host():
+                    tail = q.path().strip("/").split("/")[-1] if q.path().strip("/") else ""
+                    raw_title = tail or q.host()
+            except Exception:
+                pass
+        stem = self._safe_db_stem(raw_title)
+        return f"{stem}__{stamp}.sqlite"
+
+    def _rename_db_files(self, old_path: Path, new_path: Path) -> None:
+        if old_path.resolve() == new_path.resolve():
+            return
+        if new_path.exists():
+            suffix = hashlib.sha1(str(time.time()).encode("utf-8")).hexdigest()[:6]
+            new_path = new_path.with_name(f"{new_path.stem}__{suffix}{new_path.suffix}")
+        for side in ("", "-wal", "-shm"):
+            src = Path(str(old_path) + side)
+            dst = Path(str(new_path) + side)
+            if src.exists():
+                try:
+                    src.replace(dst)
+                except Exception:
+                    pass
+
+    def _connect(self, tab_id: str, db_file: Optional[str] = None) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path_for_tab(tab_id, db_file)))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(
@@ -175,9 +228,26 @@ class OfflineStore:
             "tabs": tabs if isinstance(tabs, list) else [],
         }
 
-    def save_tab_snapshot(self, tab_id: str, *, url: str, title: str, messages: List["Message"]) -> None:
+    def save_tab_snapshot(
+        self,
+        tab_id: str,
+        *,
+        url: str,
+        title: str,
+        messages: List["Message"],
+        db_file: Optional[str] = None,
+    ) -> str:
         now = time.time()
-        conn = self._connect(tab_id)
+        desired_name = self.suggest_db_file_name(title=title, url=url, saved_at=now)
+        current_path = self.db_path_for_tab(tab_id, db_file)
+        desired_path = self.db_path_for_tab(tab_id, desired_name)
+        try:
+            if current_path.exists() and current_path.name != desired_path.name:
+                self._rename_db_files(current_path, desired_path)
+        except Exception:
+            pass
+        final_path = desired_path if desired_path.exists() or current_path.name != desired_path.name else current_path
+        conn = self._connect(tab_id, final_path.name)
         try:
             with conn:
                 conn.execute("DELETE FROM page_state")
@@ -239,12 +309,13 @@ class OfflineStore:
                     )
         finally:
             conn.close()
+        return final_path.name
 
-    def load_tab_snapshot(self, tab_id: str) -> Optional[dict]:
-        db_path = self.db_path_for_tab(tab_id)
+    def load_tab_snapshot(self, tab_id: str, db_file: Optional[str] = None) -> Optional[dict]:
+        db_path = self.db_path_for_tab(tab_id, db_file)
         if not db_path.exists():
             return None
-        conn = self._connect(tab_id)
+        conn = self._connect(tab_id, db_path.name)
         try:
             page = {k: v for k, v in conn.execute("SELECT key, value FROM page_state")}
             messages = []
@@ -2742,6 +2813,7 @@ class MainWindow(QMainWindow):
         profile_root: Optional[Path] = None,
         offline_store: Optional[OfflineStore] = None,
         tab_id: Optional[str] = None,
+        storage_db_file: Optional[str] = None,
         initial_snapshot: Optional[dict] = None,
         initial_url: Optional[str] = "https://chatgpt.com",
     ) -> None:
@@ -2749,6 +2821,7 @@ class MainWindow(QMainWindow):
         self._tabs_host = tabs_host
         self._offline_store = offline_store
         self.tab_id = (tab_id or uuid.uuid4().hex[:12]).strip()
+        self.storage_db_file = (storage_db_file or "").strip() or None
         self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
         self.resize(1600, 900)
 
@@ -2894,7 +2967,13 @@ class MainWindow(QMainWindow):
             title = ""
         try:
             messages = self.model.messages_in_order()
-            self._offline_store.save_tab_snapshot(self.tab_id, url=url, title=title, messages=messages)
+            self.storage_db_file = self._offline_store.save_tab_snapshot(
+                self.tab_id,
+                url=url,
+                title=title,
+                messages=messages,
+                db_file=self.storage_db_file,
+            )
         except Exception:
             pass
 
@@ -2930,7 +3009,7 @@ class MainWindow(QMainWindow):
         page_state = None
         if self._offline_store is not None:
             try:
-                snap = self._offline_store.load_tab_snapshot(self.tab_id)
+                snap = self._offline_store.load_tab_snapshot(self.tab_id, self.storage_db_file)
                 page_state = (snap or {}).get("page_state") if isinstance(snap, dict) else None
             except Exception:
                 page_state = None
@@ -3799,6 +3878,7 @@ class TabbedMainWindow(QMainWindow):
         url: Optional[str] = "https://chatgpt.com",
         switch: bool = True,
         tab_id: Optional[str] = None,
+        storage_db_file: Optional[str] = None,
         initial_snapshot: Optional[dict] = None,
     ) -> Optional[MainWindow]:
         pane = MainWindow(
@@ -3807,6 +3887,7 @@ class TabbedMainWindow(QMainWindow):
             profile_root=self._profile_root,
             offline_store=self._offline_store,
             tab_id=tab_id,
+            storage_db_file=storage_db_file,
             initial_snapshot=initial_snapshot,
             initial_url=url,
         )
@@ -3880,7 +3961,13 @@ class TabbedMainWindow(QMainWindow):
                 url = pane.web_view.url().toString() or pane.offline_snapshot_url_guess()
             except Exception:
                 url = ""
-            tabs_payload.append({"tab_id": pane.tab_id, "url": url})
+            tabs_payload.append(
+                {
+                    "tab_id": pane.tab_id,
+                    "url": url,
+                    "db_file": pane.storage_db_file or "",
+                }
+            )
         try:
             self._offline_store.save_manifest(
                 {"current_index": max(0, self.tabs.currentIndex()), "tabs": tabs_payload}
@@ -3910,16 +3997,23 @@ class TabbedMainWindow(QMainWindow):
             tab_id = str(item.get("tab_id") or "").strip()
             if not tab_id:
                 continue
+            db_file = str(item.get("db_file") or "").strip() or None
             snapshot = None
             try:
-                snapshot = self._offline_store.load_tab_snapshot(tab_id)
+                snapshot = self._offline_store.load_tab_snapshot(tab_id, db_file)
             except Exception:
                 snapshot = None
             page_state = (snapshot or {}).get("page_state") if isinstance(snapshot, dict) else {}
             url = str((page_state or {}).get("url") or item.get("url") or "https://chatgpt.com")
             if not url:
                 url = "https://chatgpt.com"
-            pane = self.create_mirror_tab(url=url, switch=False, tab_id=tab_id, initial_snapshot=snapshot)
+            pane = self.create_mirror_tab(
+                url=url,
+                switch=False,
+                tab_id=tab_id,
+                storage_db_file=db_file,
+                initial_snapshot=snapshot,
+            )
             if pane is not None:
                 restored += 1
         if restored:
