@@ -1570,8 +1570,10 @@ class CodeBlockWidget(QWidget):
         self._editor: Optional[QPlainTextEdit] = None
         self._full_view: Optional[CodeFullTextWidget] = None
         self._toggle_btn: Optional[QPushButton] = None
+        self._total_btn: Optional[QPushButton] = None
         self._is_long_block = False
         self._collapsed = True
+        self._full_override = False
         self._collapsed_lines = 8
         self._expanded_lines_cap = 24
         self._build_ui()
@@ -1606,6 +1608,10 @@ class CodeBlockWidget(QWidget):
             self._toggle_btn.setCursor(Qt.PointingHandCursor)
             self._toggle_btn.clicked.connect(self._toggle_collapsed)
             header.addWidget(self._toggle_btn)
+            self._total_btn = QPushButton("Total expand")
+            self._total_btn.setCursor(Qt.PointingHandCursor)
+            self._total_btn.clicked.connect(self._toggle_total_expand)
+            header.addWidget(self._total_btn)
         self._apply_display_mode_defaults()
 
         outer.addLayout(header)
@@ -1636,6 +1642,7 @@ class CodeBlockWidget(QWidget):
 
     def _apply_display_mode_defaults(self) -> None:
         mode = self._display_mode
+        self._full_override = False
         if mode == "full":
             self._collapsed = False
         elif mode == "expanded":
@@ -1645,6 +1652,9 @@ class CodeBlockWidget(QWidget):
         if self._toggle_btn is not None:
             self._toggle_btn.setVisible(mode != "full" and self._is_long_block)
             self._toggle_btn.setText("Expand" if self._collapsed else "Collapse")
+        if self._total_btn is not None:
+            self._total_btn.setVisible(mode != "full" and self._is_long_block)
+            self._total_btn.setText("Total expand")
 
     def set_display_mode(self, mode: str) -> None:
         mode = (mode or "auto").strip().lower()
@@ -1660,11 +1670,22 @@ class CodeBlockWidget(QWidget):
     def _toggle_collapsed(self) -> None:
         if not self._is_long_block:
             return
-        if self._display_mode == "full":
+        if self._display_mode == "full" or self._full_override:
             return
         self._collapsed = not self._collapsed
         if self._toggle_btn is not None:
             self._toggle_btn.setText("Expand" if self._collapsed else "Collapse")
+        self._apply_editor_height()
+        QTimer.singleShot(0, self.relayoutRequested.emit)
+
+    def _toggle_total_expand(self) -> None:
+        if not self._is_long_block or self._display_mode == "full":
+            return
+        self._full_override = not self._full_override
+        if self._total_btn is not None:
+            self._total_btn.setText("Exit total" if self._full_override else "Total expand")
+        if self._toggle_btn is not None:
+            self._toggle_btn.setEnabled(not self._full_override)
         self._apply_editor_height()
         QTimer.singleShot(0, self.relayoutRequested.emit)
 
@@ -1673,7 +1694,7 @@ class CodeBlockWidget(QWidget):
             return
         editor = self._editor
         if self._full_view is not None:
-            use_full = self._display_mode == "full"
+            use_full = (self._display_mode == "full") or self._full_override
             self._full_view.setVisible(use_full)
             editor.setVisible(not use_full)
             if use_full:
