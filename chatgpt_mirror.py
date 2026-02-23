@@ -659,6 +659,8 @@ JS_INJECTOR = r"""
   }
 
   function messageKey(node, index, parts) {
+    var existingMirrorKey = node.getAttribute && node.getAttribute('data-cgm-message-key');
+    if (existingMirrorKey) return existingMirrorKey;
     var attrs = ['data-message-id', 'id'];
     for (var i = 0; i < attrs.length; i++) {
       var v = node.getAttribute && node.getAttribute(attrs[i]);
@@ -754,13 +756,22 @@ JS_INJECTOR = r"""
     return best.getAttribute('data-cgm-message-key') || '';
   }
 
-  function pruneDom(messageNodes, keepDomCount) {
+  function pruneDom(messageNodes, keepDomCount, state) {
     if (!Array.isArray(messageNodes) || messageNodes.length <= keepDomCount) return;
+    var now = Date.now();
     var keep = new Set(messageNodes.slice(-keepDomCount));
     messageNodes.forEach(function(node) {
       if (keep.has(node)) return;
       if (!(node instanceof Element)) return;
       if (node.matches('[data-cgm-pruned-placeholder="1"]')) return;
+      var nodeKey = (node.getAttribute && node.getAttribute('data-cgm-message-key')) || '';
+      if (nodeKey) {
+        var pinUntil = Number(state.restorePinnedUntilByKey && state.restorePinnedUntilByKey.get(nodeKey) || 0);
+        if (pinUntil > now) return;
+        if (state.restorePinnedUntilByKey && pinUntil > 0) {
+          state.restorePinnedUntilByKey.delete(nodeKey);
+        }
+      }
       var rect = node.getBoundingClientRect();
       var height = Math.max(24, Math.round(rect.height || 24));
       var ph = document.createElement('div');
@@ -779,11 +790,58 @@ JS_INJECTOR = r"""
       ph.style.display = 'flex';
       ph.style.alignItems = 'center';
       ph.style.padding = '6px 10px';
+      ph.style.cursor = 'default';
       ph.textContent = 'Mirrored in native viewer (DOM pruned)';
       try {
+        if (k) {
+          state.prunedNodeCache.set(k, node);  // park the original DOM node (preserves listeners/UI state best-effort)
+          state.placeholderByKey.set(k, ph);
+          state.prunedKeyQueue.push(k);
+          ph.title = 'Double click to restore this pruned DOM block';
+          ph.addEventListener('dblclick', function(ev) {
+            try {
+              ev.preventDefault();
+              ev.stopPropagation();
+            } catch (e) {}
+            if (!state || !state.restorePrunedOnView) return;
+            restorePrunedByKey(state, k);
+          }, { passive: false });
+          // Keep cache bounded.
+          while (state.prunedKeyQueue.length > state.maxPrunedCache) {
+            var evictKey = state.prunedKeyQueue.shift();
+            if (!evictKey) break;
+            // Only evict if still pruned and not restored already.
+            if (state.placeholderByKey.has(evictKey)) {
+              state.prunedNodeCache.delete(evictKey);
+              var stalePh = state.placeholderByKey.get(evictKey);
+              if (stalePh && stalePh instanceof Element && !document.contains(stalePh)) {
+                state.placeholderByKey.delete(evictKey);
+              }
+            }
+          }
+        }
         node.replaceWith(ph);
       } catch (e) {}
     });
+  }
+
+  function restorePrunedByKey(state, key) {
+    if (!state) return 0;
+    key = String(key || '');
+    if (!key) return 0;
+    var ph = state.placeholderByKey.get(key);
+    var node = state.prunedNodeCache.get(key);
+    if (!(ph instanceof Element) || !(node instanceof Element)) return 0;
+    try {
+      ph.replaceWith(node);
+      state.placeholderByKey.delete(key);
+      if (state.restorePinnedUntilByKey) {
+        state.restorePinnedUntilByKey.set(key, Date.now() + (state.restorePinMs || 15000));
+      }
+      return 1;
+    } catch (e) {
+      return 0;
+    }
   }
 
   function startExtractor(bridgeObj) {
@@ -795,6 +853,13 @@ JS_INJECTOR = r"""
     state.bridge = bridgeObj;
     state.hashByKey = new Map();
     state.keepDom = 30;
+    state.restorePrunedOnView = false;
+    state.prunedNodeCache = new Map();
+    state.placeholderByKey = new Map();
+    state.prunedKeyQueue = [];
+    state.maxPrunedCache = 120;
+    state.restorePinnedUntilByKey = new Map();
+    state.restorePinMs = 15000;
     state.pending = false;
     state.lastScanAt = 0;
     state.lastTopKeySent = '';
@@ -854,7 +919,7 @@ JS_INJECTOR = r"""
       }
 
       sendDeltas(deltas);
-      pruneDom(nodes, state.keepDom);
+      pruneDom(nodes, state.keepDom, state);
       emitTopKeyIfChanged('scan');
       return 'scan:' + reason + ':nodes=' + nodes.length + ':deltas=' + deltas.length;
     }
@@ -1566,6 +1631,7 @@ class MessageListPane(QWidget):
     webToNativeSyncChanged = Signal(bool)
     nativeToWebSyncChanged = Signal(bool)
     keepDomChanged = Signal(int)
+    restorePrunedOnViewChanged = Signal(bool)
     browserLanguageChanged = Signal(str)
     resetSessionRequested = Signal()
     exportRequested = Signal(str)
@@ -1579,6 +1645,7 @@ class MessageListPane(QWidget):
         self._web_to_native_sync_enabled = True
         self._native_to_web_sync_enabled = True
         self._keep_dom_count = 30
+        self._restore_pruned_on_view = False
         self._browser_language_mode = "system"
         self._build_ui()
         self._connect_model()
@@ -1630,6 +1697,11 @@ class MessageListPane(QWidget):
             action.triggered.connect(lambda checked=False, c=count: self.keepDomChanged.emit(c))
             self.keep_dom_group.addAction(action)
             keep_dom_menu.addAction(action)
+
+        restore_pruned_action = QAction("Consenti ripristino DOM pruned con doppio click", self, checkable=True)
+        restore_pruned_action.setChecked(self._restore_pruned_on_view)
+        restore_pruned_action.toggled.connect(self.restorePrunedOnViewChanged.emit)
+        settings_menu.addAction(restore_pruned_action)
 
         browser_lang_menu = settings_menu.addMenu("Lingua browser")
         self.browser_lang_group = QActionGroup(self)
@@ -1892,12 +1964,14 @@ class MainWindow(QMainWindow):
         self._web_to_native_sync_enabled = True
         self._native_to_web_sync_enabled = True
         self._keep_dom_count = 30
+        self._restore_pruned_on_view_enabled = False
         self._profile_root = profile_root
         self.left_pane.list_view.verticalScrollBar().valueChanged.connect(self._on_native_scroll_value_changed)
         self.left_pane.autoScrollChanged.connect(self._on_auto_scroll_changed)
         self.left_pane.webToNativeSyncChanged.connect(self._on_web_to_native_sync_changed)
         self.left_pane.nativeToWebSyncChanged.connect(self._on_native_to_web_sync_changed)
         self.left_pane.keepDomChanged.connect(self._on_keep_dom_changed)
+        self.left_pane.restorePrunedOnViewChanged.connect(self._on_restore_pruned_on_view_changed)
         self.left_pane.browserLanguageChanged.connect(self._on_browser_language_changed)
         self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
         self.left_pane.exportRequested.connect(self._on_export_requested)
@@ -1919,6 +1993,7 @@ class MainWindow(QMainWindow):
         # Inject bootstrap + extractor after each page load/navigation.
         self.web_view.page().runJavaScript(JS_INJECTOR)
         QTimer.singleShot(800, self._apply_keep_dom_setting_to_web)
+        QTimer.singleShot(900, self._apply_restore_pruned_on_view_setting_to_web)
 
     @Slot(str)
     def on_delta_received(self, json_string: str) -> None:
@@ -2014,6 +2089,23 @@ class MainWindow(QMainWindow):
             "if(window.__chatgptMirror){"
             f"window.__chatgptMirror.keepDom={int(self._keep_dom_count)};"
             "if(typeof window.__chatgptMirror.scanNow==='function'){window.__chatgptMirror.scanNow('keepdom_change');}"
+            "}"
+            "})();"
+        )
+        self.web_view.page().runJavaScript(script)
+
+    @Slot(bool)
+    def _on_restore_pruned_on_view_changed(self, enabled: bool) -> None:
+        self._restore_pruned_on_view_enabled = bool(enabled)
+        self._apply_restore_pruned_on_view_setting_to_web()
+
+    def _apply_restore_pruned_on_view_setting_to_web(self) -> None:
+        enabled_js = "true" if self._restore_pruned_on_view_enabled else "false"
+        script = (
+            "(function(){"
+            "if(window.__chatgptMirror){"
+            f"window.__chatgptMirror.restorePrunedOnView={enabled_js};"
+            "if(typeof window.__chatgptMirror.scanNow==='function'){window.__chatgptMirror.scanNow('restore_pruned_toggle');}"
             "}"
             "})();"
         )
