@@ -529,7 +529,8 @@ JS_INJECTOR = r"""
       return {
         type: 'image',
         src: src,
-        alt: (imgEl.getAttribute('alt') || '').trim()
+        alt: (imgEl.getAttribute('alt') || '').trim(),
+        kind: (opts.kind || (inRichEntityImage ? 'rich-entity' : 'image'))
       };
     }
 
@@ -547,7 +548,7 @@ JS_INJECTOR = r"""
       var out = [];
       var seenSrc = new Set();
       for (var i = 0; i < Math.min(imgs.length, 12); i++) {
-        var part = imagePartFromImg(imgs[i], { allowButtonAncestor: true });
+        var part = imagePartFromImg(imgs[i], { allowButtonAncestor: true, kind: 'gallery' });
         if (!part) continue;
         if (seenSrc.has(part.src)) continue;
         seenSrc.add(part.src);
@@ -563,7 +564,7 @@ JS_INJECTOR = r"""
       var src = (rich.currentSrc || rich.getAttribute('src') || '').trim();
       if (!src) return null;
       var alt = (rich.getAttribute('alt') || '').trim();
-      return { type: 'image', src: src, alt: alt };
+      return { type: 'image', src: src, alt: alt, kind: 'rich-entity' };
     }
 
     function ensureLineBreak() {
@@ -761,7 +762,7 @@ JS_INJECTOR = r"""
         if (c) cleaned.push({ type: 'code', lang: p.lang || '', code: c });
       } else if (p.type === 'image') {
         var srcI = (p.src || '').trim();
-        if (srcI) cleaned.push({ type: 'image', src: srcI, alt: (p.alt || '') });
+        if (srcI) cleaned.push({ type: 'image', src: srcI, alt: (p.alt || ''), kind: (p.kind || '') });
       }
     }
 
@@ -1421,6 +1422,7 @@ class MessagePart:
     lang: str = ""
     image_url: str = ""
     alt: str = ""
+    image_kind: str = ""
 
 
 @dataclass
@@ -1444,7 +1446,9 @@ class Message:
                 head = f"[code:{lang}] " if lang else "[code] "
                 chunks.append(head + part.code.strip().splitlines()[0])
             elif part.type == "image" and part.image_url.strip():
-                chunks.append("[image] " + (part.alt.strip() or part.image_url.strip()))
+                kind = (part.image_kind or "").strip()
+                prefix = "[gallery image]" if kind == "gallery" else "[image]"
+                chunks.append(prefix + " " + (part.alt.strip() or part.image_url.strip()))
         text = " ".join(chunks).strip()
         if len(text) <= limit:
             return text
@@ -1581,6 +1585,7 @@ class MessageListModel(QAbstractListModel):
                                 type="image",
                                 image_url=src,
                                 alt=str(item.get("alt") or ""),
+                                image_kind=str(item.get("kind") or ""),
                             )
                         )
             if not parts:
@@ -1985,6 +1990,8 @@ class MessageRowWidget(QFrame):
         self._toggle_collapse_cb = toggle_collapse_cb
         self._copy_code_cb = copy_code_cb
         self._code_block_display_mode = (code_block_display_mode or "auto").strip().lower()
+        self._show_rich_entity_images = True
+        self._show_gallery_images = True
         self._message: Optional[Message] = None
         self._index_display = 0
         self._last_emitted_size_hint: Optional[QSize] = None
@@ -2072,6 +2079,27 @@ class MessageRowWidget(QFrame):
         if self._message is not None:
             self._render()
 
+    def set_image_visibility(self, rich_entity_enabled: bool, gallery_enabled: bool) -> None:
+        rich_entity_enabled = bool(rich_entity_enabled)
+        gallery_enabled = bool(gallery_enabled)
+        if (
+            rich_entity_enabled == self._show_rich_entity_images
+            and gallery_enabled == self._show_gallery_images
+        ):
+            return
+        self._show_rich_entity_images = rich_entity_enabled
+        self._show_gallery_images = gallery_enabled
+        if self._message is not None:
+            self._render()
+
+    def _is_image_part_visible(self, part: MessagePart) -> bool:
+        kind = (part.image_kind or "").strip().lower()
+        if kind == "gallery":
+            return self._show_gallery_images
+        if kind == "rich-entity":
+            return self._show_rich_entity_images
+        return self._show_gallery_images or self._show_rich_entity_images
+
     def _render(self) -> None:
         if self._message is None:
             return
@@ -2103,7 +2131,7 @@ class MessageRowWidget(QFrame):
                     code_widget.copyRequested.connect(self._copy_code_cb)
                     code_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(code_widget)
-                elif part.type == "image":
+                elif part.type == "image" and self._is_image_part_visible(part):
                     img_widget = ImagePartWidget(part.image_url, part.alt)
                     img_widget.copyRequested.connect(self._copy_code_cb)
                     img_widget.relayoutRequested.connect(self._schedule_relayout)
@@ -2139,6 +2167,8 @@ class MessageListPane(QWidget):
     exportRequested = Signal(str)
     exportDebugVisibleRequested = Signal()
     exportPdfImagesDebugRequested = Signal()
+    richEntityImagesVisibleChanged = Signal(bool)
+    galleryImagesVisibleChanged = Signal(bool)
 
     def __init__(self, model: MessageListModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2152,6 +2182,8 @@ class MessageListPane(QWidget):
         self._scroll_sync_debug_enabled = False
         self._code_block_display_mode = "auto"
         self._browser_language_mode = "system"
+        self._show_rich_entity_images = True
+        self._show_gallery_images = True
         self._build_ui()
         self._connect_model()
 
@@ -2217,6 +2249,16 @@ class MessageListPane(QWidget):
             action.triggered.connect(lambda checked=False, m=mode: self._set_code_block_display_mode(m))
             self.code_block_mode_group.addAction(action)
             code_block_menu.addAction(action)
+
+        rich_entity_images_action = QAction("Mostra rich-entity image (Native + export)", self, checkable=True)
+        rich_entity_images_action.setChecked(self._show_rich_entity_images)
+        rich_entity_images_action.toggled.connect(self._set_rich_entity_images_visible)
+        settings_menu.addAction(rich_entity_images_action)
+
+        gallery_images_action = QAction("Mostra gallery immagini (Native + export)", self, checkable=True)
+        gallery_images_action.setChecked(self._show_gallery_images)
+        gallery_images_action.toggled.connect(self._set_gallery_images_visible)
+        settings_menu.addAction(gallery_images_action)
 
         restore_pruned_action = QAction("Consenti ripristino DOM pruned con doppio click", self, checkable=True)
         restore_pruned_action.setChecked(self._restore_pruned_on_view)
@@ -2343,6 +2385,7 @@ class MessageListPane(QWidget):
             copy_code_cb=self.copy_code,
             code_block_display_mode=self._code_block_display_mode,
         )
+        widget.set_image_visibility(self._show_rich_entity_images, self._show_gallery_images)
         widget.relayoutRequested.connect(self._on_row_relayout_requested)
         self._widgets_by_key[msg.key] = widget
 
@@ -2365,6 +2408,37 @@ class MessageListPane(QWidget):
             widget = self._widgets_by_key.get(msg.key)
             if widget is not None:
                 widget.set_code_block_display_mode(mode)
+
+    def _apply_image_visibility_to_rows(self) -> None:
+        for row in range(self.model.rowCount()):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            widget = self._widgets_by_key.get(msg.key)
+            if widget is not None:
+                widget.set_image_visibility(self._show_rich_entity_images, self._show_gallery_images)
+
+    def _set_rich_entity_images_visible(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._show_rich_entity_images:
+            return
+        self._show_rich_entity_images = enabled
+        self._apply_image_visibility_to_rows()
+        self.richEntityImagesVisibleChanged.emit(enabled)
+
+    def _set_gallery_images_visible(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._show_gallery_images:
+            return
+        self._show_gallery_images = enabled
+        self._apply_image_visibility_to_rows()
+        self.galleryImagesVisibleChanged.emit(enabled)
+
+    def show_rich_entity_images_enabled(self) -> bool:
+        return self._show_rich_entity_images
+
+    def show_gallery_images_enabled(self) -> bool:
+        return self._show_gallery_images
 
     @Slot(str, QSize)
     def _on_row_relayout_requested(self, key: str, size_hint: QSize) -> None:
@@ -2791,7 +2865,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_export_requested(self, fmt: str) -> None:
-        messages = self.model.messages_in_order()
+        messages = self._messages_for_export()
         if not messages:
             QMessageBox.information(self, "Esporta", "Nessun messaggio da esportare.")
             return
@@ -2845,6 +2919,44 @@ class MainWindow(QMainWindow):
                 return
             self._export_pdf_from_messages(messages, path)
             return
+
+    def _messages_for_export(self) -> List[Message]:
+        messages = self.model.messages_in_order()
+        try:
+            include_rich = self.left_pane.show_rich_entity_images_enabled()
+            include_gallery = self.left_pane.show_gallery_images_enabled()
+        except Exception:
+            include_rich = True
+            include_gallery = True
+        if include_rich and include_gallery:
+            return messages
+
+        filtered: List[Message] = []
+        for m in messages:
+            parts: List[MessagePart] = []
+            for p in m.parts:
+                if p.type != "image":
+                    parts.append(p)
+                    continue
+                kind = (p.image_kind or "").strip().lower()
+                if kind == "gallery" and include_gallery:
+                    parts.append(p)
+                elif kind == "rich-entity" and include_rich:
+                    parts.append(p)
+                elif kind not in {"gallery", "rich-entity"} and (include_rich or include_gallery):
+                    parts.append(p)
+            if not parts:
+                continue
+            filtered.append(
+                Message(
+                    key=m.key,
+                    role=m.role,
+                    parts=parts,
+                    collapsed=m.collapsed,
+                    size_hint=m.size_hint,
+                )
+            )
+        return filtered
 
     def _default_export_basename(self) -> str:
         title = self._current_chat_title_guess()
@@ -3252,11 +3364,16 @@ class MainWindow(QMainWindow):
                     {"type": "text", "text": p.text}
                     if p.type == "text"
                     else (
-                        {"type": "code", "lang": p.lang, "code": p.code}
-                        if p.type == "code"
-                        else {"type": "image", "src": p.image_url, "alt": p.alt}
-                    )
-                )
+                                    {"type": "code", "lang": p.lang, "code": p.code}
+                                    if p.type == "code"
+                                    else {
+                                        "type": "image",
+                                        "src": p.image_url,
+                                        "alt": p.alt,
+                                        "kind": p.image_kind,
+                                    }
+                                )
+                            )
                 for p in msg.parts
             ],
             ensure_ascii=False,
