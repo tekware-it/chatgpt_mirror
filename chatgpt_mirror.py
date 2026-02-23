@@ -15,7 +15,6 @@ Important constraints:
 from __future__ import annotations
 
 import json
-import base64
 import re
 import sys
 import time
@@ -23,8 +22,6 @@ from html import escape as html_escape
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-import urllib.request
-import urllib.error
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -2885,49 +2882,6 @@ class MainWindow(QMainWindow):
             f'<pre class="codehilite"><code>{html_escape(code)}</code></pre></div>'
         )
 
-    def _image_src_for_pdf(self, src: str) -> str:
-        src = (src or "").strip()
-        if not src:
-            return src
-        if src.startswith("data:image/"):
-            return src
-        cache = getattr(self, "_pdf_image_data_uri_cache", None)
-        if cache is None:
-            cache = {}
-            self._pdf_image_data_uri_cache = cache
-        if src in cache:
-            return cache[src]
-        # Best-effort: embed remote image as data URI so QTextDocument PDF export can render it.
-        try:
-            req = urllib.request.Request(
-                src,
-                headers={"User-Agent": "chatgpt-mirror/1.0", "Accept": "image/*,*/*;q=0.8"},
-            )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = resp.read()
-                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if not data:
-                cache[src] = src
-                return src
-            if not ctype.startswith("image/"):
-                if data.startswith(b"\x89PNG"):
-                    ctype = "image/png"
-                elif data[:3] == b"\xff\xd8\xff":
-                    ctype = "image/jpeg"
-                elif data[:6] in (b"GIF87a", b"GIF89a"):
-                    ctype = "image/gif"
-                elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
-                    ctype = "image/webp"
-                else:
-                    ctype = "image/png"
-            b64 = base64.b64encode(data).decode("ascii")
-            embedded = f"data:{ctype};base64,{b64}"
-            cache[src] = embedded
-            return embedded
-        except Exception:
-            cache[src] = src
-            return src
-
     def _conversation_as_html_for_pdf(self, messages: List[Message]) -> str:
         pygments_css = ""
         if PYGMENTS_AVAILABLE and HtmlFormatter:
@@ -2957,10 +2911,9 @@ class MainWindow(QMainWindow):
                     src = (part.image_url or "").strip()
                     if src:
                         alt = html_escape((part.alt or "").strip() or "image")
-                        pdf_src = self._image_src_for_pdf(src)
                         blocks.append(
                             f'<div class="image-part"><a href="{html_escape(src)}">{alt}</a><br>'
-                            f'<img src="{html_escape(pdf_src)}" alt="{alt}" class="inline-image"></div>'
+                            f'<img src="{html_escape(src)}" alt="{alt}" class="inline-image"></div>'
                         )
             blocks.append("</section>")
 
