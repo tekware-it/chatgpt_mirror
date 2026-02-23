@@ -505,7 +505,8 @@ JS_INJECTOR = r"""
       };
     }
 
-    function imagePartFromImg(imgEl) {
+    function imagePartFromImg(imgEl, opts) {
+      opts = opts || {};
       if (!(imgEl instanceof Element)) return null;
       // Images embedded inside inline rich-entity text (often inside <strong> in list items)
       // break markdown markers if extracted as standalone parts. Skip them for now.
@@ -515,7 +516,7 @@ JS_INJECTOR = r"""
       if (!src) return null;
       if (/^data:image\//i.test(src) && src.length > 2_000_000) return null;
       if (imgEl.closest && imgEl.closest('[data-testid*="webpage-citation-pill"]')) return null;
-      if (imgEl.closest && imgEl.closest('button,[role="button"]')) return null;
+      if (!opts.allowButtonAncestor && imgEl.closest && imgEl.closest('button,[role="button"]')) return null;
       var cls = classStr(imgEl);
       if (cls.includes('icon-sm') || cls.includes('favicon')) return null;
       var host = '';
@@ -530,6 +531,29 @@ JS_INJECTOR = r"""
         src: src,
         alt: (imgEl.getAttribute('alt') || '').trim()
       };
+    }
+
+    function imagePartsFromGalleryContainer(el) {
+      if (!(el instanceof Element)) return null;
+      var tag = (el.tagName || '').toLowerCase();
+      if (tag !== 'div') return null;
+      var cls = classStr(el);
+      // ChatGPT "rich gallery" blocks are usually horizontal flex/no-scrollbar strips with image buttons.
+      if (!(cls.includes('no-scrollbar') || cls.includes('overflow-auto') || cls.includes('flex-nowrap'))) {
+        return null;
+      }
+      var imgs = el.querySelectorAll('button img, [role="button"] img');
+      if (!imgs || imgs.length < 2) return null;
+      var out = [];
+      var seenSrc = new Set();
+      for (var i = 0; i < Math.min(imgs.length, 12); i++) {
+        var part = imagePartFromImg(imgs[i], { allowButtonAncestor: true });
+        if (!part) continue;
+        if (seenSrc.has(part.src)) continue;
+        seenSrc.add(part.src);
+        out.push(part);
+      }
+      return out.length ? out : null;
     }
 
     function imagePartFromListItemRichEntity(liEl) {
@@ -589,6 +613,16 @@ JS_INJECTOR = r"""
           flushText();
           parts.push(imgPart);
         }
+        return;
+      }
+
+      var galleryParts = imagePartsFromGalleryContainer(el);
+      if (galleryParts) {
+        flushText();
+        for (var gp = 0; gp < galleryParts.length; gp++) {
+          parts.push(galleryParts[gp]);
+        }
+        ensureLineBreak();
         return;
       }
 
