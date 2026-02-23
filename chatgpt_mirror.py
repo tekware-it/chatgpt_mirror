@@ -29,6 +29,7 @@ from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
     QEventLoop,
+    QMarginsF,
     QModelIndex,
     QObject,
     QLocale,
@@ -41,7 +42,7 @@ from PySide6.QtCore import (
     Slot,
     QStandardPaths,
 )
-from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPixmap
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPageLayout, QPageSize, QPixmap
 from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument, QSyntaxHighlighter
 from PySide6.QtWidgets import (
     QApplication,
@@ -286,7 +287,7 @@ JS_INJECTOR = r"""
 
     function hay(el) {
       var pieces = [];
-      ['data-message-author-role', 'data-testid', 'aria-label', 'id', 'class'].forEach(function(attr) {
+      ['data-message-author-role', 'data-turn', 'data-testid', 'aria-label', 'id', 'class'].forEach(function(attr) {
         var v = el.getAttribute && el.getAttribute(attr);
         if (v) pieces.push(v);
       });
@@ -300,6 +301,13 @@ JS_INJECTOR = r"""
       if (txt.includes('human')) return 'user';
     }
 
+    var authorNode = node.querySelector('[data-message-author-role]');
+    if (authorNode) {
+      var authorRole = (authorNode.getAttribute('data-message-author-role') || '').toLowerCase();
+      if (authorRole.includes('assistant')) return 'assistant';
+      if (authorRole.includes('user') || authorRole.includes('human')) return 'user';
+    }
+
     var ariaCandidates = node.querySelectorAll('[aria-label], [alt]');
     for (var k = 0; k < Math.min(ariaCandidates.length, 10); k++) {
       var t = ((ariaCandidates[k].getAttribute('aria-label') || '') + ' ' +
@@ -307,6 +315,10 @@ JS_INJECTOR = r"""
       if (t.includes('assistant') || t.includes('chatgpt')) return 'assistant';
       if (t.includes('you') || t.includes('user')) return 'user';
     }
+
+    // Assistant replies usually contain the markdown/prose renderer; user messages are
+    // typically plain bubbles and often miss stable role markers in newer layouts.
+    if (node.querySelector('.markdown.prose, .markdown-new-styling')) return 'assistant';
 
     var labelText = (node.innerText || "").slice(0, 200).toLowerCase();
     if (labelText.startsWith('you\n') || labelText.startsWith('you ')) return 'user';
@@ -2994,9 +3006,7 @@ class MainWindow(QMainWindow):
       color: #111827;
       font-size: 11pt;
       line-height: 1.38;
-      /* QtWebEngine printToPdf can ignore @page margins on some builds:
-         keep an explicit body margin as a reliable fallback. */
-      margin: 12mm;
+      margin: 0;
     }}
     h1,h2,h3,h4,h5,h6 {{ color: #111827; }}
     p {{ margin: 0 0 8px 0; }}
@@ -3005,13 +3015,18 @@ class MainWindow(QMainWindow):
       border-radius: 10px;
       padding: 8pt 9pt;
       margin: 0 0 10pt 0;
-      page-break-inside: avoid;
+      /* Allow page breaks across long messages; avoiding breaks here can create
+         large gaps and make every message jump to a new page. */
+      page-break-inside: auto;
+      break-inside: auto;
     }}
     .msg-head {{
       font-weight: 700;
       font-size: 10.5pt;
       margin-bottom: 6pt;
       color: #1f2937;
+      page-break-after: avoid;
+      break-after: avoid;
     }}
     .msg.user .msg-head {{ color: #065f46; }}
     .msg.assistant .msg-head {{ color: #1e3a8a; }}
@@ -3119,7 +3134,13 @@ class MainWindow(QMainWindow):
                 try:
                     if hasattr(page, "pdfPrintingFinished"):
                         page.pdfPrintingFinished.connect(_on_pdf_finished)  # type: ignore[attr-defined]
-                    page.printToPdf(path)
+                    layout = QPageLayout(
+                        QPageSize(QPageSize.A4),
+                        QPageLayout.Portrait,
+                        QMarginsF(12, 12, 12, 12),
+                        QPageLayout.Millimeter,
+                    )
+                    page.printToPdf(path, layout)
                 except Exception as exc:
                     print(f"[pdf-export] printToPdf start failed: {exc}")
                     _finish_loop()
