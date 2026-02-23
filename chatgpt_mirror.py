@@ -3861,6 +3861,25 @@ class TabbedMainWindow(QMainWindow):
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         self.tabs.currentChanged.connect(lambda _i: self.schedule_manifest_save())
+        self._tabs_plus_btn = QToolButton(self)
+        self._tabs_plus_btn.setText("+")
+        self._tabs_plus_btn.setPopupMode(QToolButton.InstantPopup)
+        self._tabs_plus_btn.setToolTip("Nuovo / Apri")
+        self._tabs_plus_btn.setCursor(Qt.PointingHandCursor)
+        self._tabs_plus_btn.setStyleSheet(
+            "QToolButton { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; "
+            "padding: 1px 8px; font-weight: 700; }"
+            "QToolButton:hover { background: #eef2f7; }"
+        )
+        plus_menu = QMenu(self._tabs_plus_btn)
+        act_new_tab = QAction("Nuovo tab", self)
+        act_new_tab.triggered.connect(lambda: self.create_mirror_tab(url="https://chatgpt.com", switch=True))
+        plus_menu.addAction(act_new_tab)
+        act_open_tab = QAction("Apri snapshot locale (.sqlite)…", self)
+        act_open_tab.triggered.connect(self._open_snapshot_dialog)
+        plus_menu.addAction(act_open_tab)
+        self._tabs_plus_btn.setMenu(plus_menu)
+        self.tabs.setCornerWidget(self._tabs_plus_btn, Qt.TopLeftCorner)
         self.setCentralWidget(self.tabs)
         self._manifest_save_timer = QTimer(self)
         self._manifest_save_timer.setSingleShot(True)
@@ -3909,6 +3928,58 @@ class TabbedMainWindow(QMainWindow):
             if self.tabs.widget(i) is pane:
                 return i
         return -1
+
+    def _focus_or_open_snapshot_db(self, db_file_name: str) -> bool:
+        db_file_name = Path(db_file_name or "").name
+        if not db_file_name:
+            return False
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if isinstance(pane, MainWindow) and (pane.storage_db_file or "") == db_file_name:
+                self.tabs.setCurrentIndex(i)
+                return True
+        try:
+            snapshot = self._offline_store.load_tab_snapshot(uuid.uuid4().hex[:8], db_file_name)
+        except Exception:
+            snapshot = None
+        if not isinstance(snapshot, dict):
+            return False
+        page_state = snapshot.get("page_state") if isinstance(snapshot.get("page_state"), dict) else {}
+        url = str((page_state or {}).get("url") or "https://chatgpt.com")
+        pane = self.create_mirror_tab(
+            url=url,
+            switch=True,
+            tab_id=uuid.uuid4().hex[:12],
+            storage_db_file=db_file_name,
+            initial_snapshot=snapshot,
+        )
+        return pane is not None
+
+    @Slot()
+    def _open_snapshot_dialog(self) -> None:
+        start_dir = str(self._offline_store.tabs_dir)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Apri snapshot locale",
+            start_dir,
+            "SQLite (*.sqlite);;All files (*)",
+        )
+        if not path:
+            return
+        chosen = Path(path)
+        if chosen.suffix.lower() != ".sqlite":
+            QMessageBox.information(self, "Apri snapshot", "Seleziona un file .sqlite.")
+            return
+        # MVP: support guaranteed for snapshots in data/tabs/.
+        if chosen.parent.resolve() != self._offline_store.tabs_dir.resolve():
+            QMessageBox.information(
+                self,
+                "Apri snapshot",
+                f"Per ora seleziona un file dentro:\n{self._offline_store.tabs_dir}",
+            )
+            return
+        if not self._focus_or_open_snapshot_db(chosen.name):
+            QMessageBox.warning(self, "Apri snapshot", "Impossibile aprire lo snapshot selezionato.")
 
     def _update_tab_title_for_pane(self, pane: MainWindow, title: str) -> None:
         idx = self._pane_tab_index(pane)
