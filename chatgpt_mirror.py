@@ -234,6 +234,7 @@ class OfflineStore:
         *,
         url: str,
         title: str,
+        tab_title: str = "",
         messages: List["Message"],
         db_file: Optional[str] = None,
     ) -> str:
@@ -253,7 +254,13 @@ class OfflineStore:
                 conn.execute("DELETE FROM page_state")
                 conn.executemany(
                     "INSERT INTO page_state(key, value) VALUES(?, ?)",
-                    [("url", url or ""), ("title", title or ""), ("saved_at", str(now)), ("schema", "1")],
+                    [
+                        ("url", url or ""),
+                        ("title", title or ""),
+                        ("tab_title", tab_title or title or ""),
+                        ("saved_at", str(now)),
+                        ("schema", "1"),
+                    ],
                 )
 
                 conn.execute("DELETE FROM messages")
@@ -2965,12 +2972,20 @@ class MainWindow(QMainWindow):
             title = self.web_view.title() or ""
         except Exception:
             title = ""
+        tab_title = ""
+        host = self._tabs_host
+        if host is not None and hasattr(host, "tab_display_title_for_pane"):
+            try:
+                tab_title = str(host.tab_display_title_for_pane(self) or "")  # type: ignore[attr-defined]
+            except Exception:
+                tab_title = ""
         try:
             messages = self.model.messages_in_order()
             self.storage_db_file = self._offline_store.save_tab_snapshot(
                 self.tab_id,
                 url=url,
                 title=title,
+                tab_title=tab_title,
                 messages=messages,
                 db_file=self.storage_db_file,
             )
@@ -3911,13 +3926,23 @@ class TabbedMainWindow(QMainWindow):
             initial_url=url,
         )
         idx = self.tabs.addTab(pane, "Nuovo tab")
+        saved_tab_title = ""
+        if isinstance(initial_snapshot, dict):
+            page_state = initial_snapshot.get("page_state")
+            if isinstance(page_state, dict):
+                saved_tab_title = str(page_state.get("tab_title") or "").strip()
+        if saved_tab_title:
+            shown = saved_tab_title if len(saved_tab_title) <= 28 else (saved_tab_title[:27].rstrip() + "…")
+            self.tabs.setTabText(idx, shown)
+            self.tabs.setTabToolTip(idx, saved_tab_title)
         try:
             pane.web_view.titleChanged.connect(lambda title, p=pane: self._update_tab_title_for_pane(p, title))
             pane.web_view.urlChanged.connect(lambda _u, p=pane: self._update_tab_title_for_pane(p, pane.web_view.title()))
             pane.web_view.urlChanged.connect(lambda _u: self.schedule_manifest_save())
         except Exception:
             pass
-        self._update_tab_title_for_pane(pane, pane.web_view.title())
+        if not saved_tab_title:
+            self._update_tab_title_for_pane(pane, pane.web_view.title())
         if switch:
             self.tabs.setCurrentIndex(idx)
         self.schedule_manifest_save()
@@ -3928,6 +3953,19 @@ class TabbedMainWindow(QMainWindow):
             if self.tabs.widget(i) is pane:
                 return i
         return -1
+
+    def _is_generic_chatgpt_title(self, title: str) -> bool:
+        t = (title or "").strip().lower()
+        return t.startswith("chatgpt.com")
+
+    def tab_display_title_for_pane(self, pane: MainWindow) -> str:
+        idx = self._pane_tab_index(pane)
+        if idx < 0:
+            return ""
+        try:
+            return self.tabs.tabText(idx) or ""
+        except Exception:
+            return ""
 
     def _focus_or_open_snapshot_db(self, db_file_name: str) -> bool:
         db_file_name = Path(db_file_name or "").name
@@ -3985,6 +4023,11 @@ class TabbedMainWindow(QMainWindow):
         idx = self._pane_tab_index(pane)
         if idx < 0:
             return
+        current_text = (self.tabs.tabText(idx) or "").strip()
+        incoming_raw = (title or "").strip()
+        if self._is_generic_chatgpt_title(incoming_raw):
+            if current_text and current_text not in {"Nuovo tab", "ChatGPT"}:
+                return
         t = (title or "").strip()
         if " - " in t:
             left, right = t.rsplit(" - ", 1)
