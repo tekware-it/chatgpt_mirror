@@ -34,10 +34,40 @@ def ensure_profile_root() -> Path:
 
 
 def ensure_data_root() -> Path:
-    """Return the local app data directory used for tab manifests and SQLite snapshots."""
-    root = Path(__file__).resolve().parent / "data"
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "tabs").mkdir(parents=True, exist_ok=True)
+    """Return a writable app data directory for manifests and SQLite snapshots.
+
+    This must not live next to the executable/module because packaged apps
+    (especially AppImage on Linux and macOS app bundles) are often mounted or
+    installed read-only. We therefore use the OS-specific user data directory.
+
+    A best-effort migration from the legacy project-local `./data` directory is
+    attempted only when the destination has not been initialized yet.
+    """
+    app_data_root = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+    if not app_data_root:
+        app_data_root = str(Path.home() / ".local" / "share" / "chatgpt_mirror")
+
+    root = Path(app_data_root) / "offline"
+    tabs_dir = root / "tabs"
+    tabs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Best-effort one-time migration from the old project-local data directory.
+    legacy_root = Path(__file__).resolve().parent / "data"
+    legacy_manifest = legacy_root / "tabs.json"
+    if legacy_root.exists() and legacy_root != root and not (root / "tabs.json").exists():
+        try:
+            if legacy_manifest.exists():
+                (root / "tabs.json").write_bytes(legacy_manifest.read_bytes())
+            legacy_tabs_dir = legacy_root / "tabs"
+            if legacy_tabs_dir.exists():
+                for src in legacy_tabs_dir.glob("*.sqlite*"):
+                    dst = tabs_dir / src.name
+                    if not dst.exists():
+                        dst.write_bytes(src.read_bytes())
+        except Exception:
+            # Migration is non-critical: the app can start with an empty store.
+            pass
+
     return root
 
 
