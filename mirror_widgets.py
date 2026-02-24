@@ -842,6 +842,7 @@ class MessageListPane(QWidget):
     exportPdfImagesDebugRequested = Signal()
     richEntityImagesVisibleChanged = Signal(bool)
     galleryImagesVisibleChanged = Signal(bool)
+    aboutRequested = Signal()
 
     def __init__(self, model: MessageListModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -985,6 +986,11 @@ class MessageListPane(QWidget):
         pdf_img_debug_action = QAction("Debug PDF images (.txt)", self)
         pdf_img_debug_action.triggered.connect(self.exportPdfImagesDebugRequested.emit)
         advanced_menu.addAction(pdf_img_debug_action)
+
+        settings_menu.addSeparator()
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.aboutRequested.emit)
+        settings_menu.addAction(about_action)
 
         self.settings_btn.setMenu(settings_menu)
         header_row.addWidget(self.settings_btn, 0, Qt.AlignVCenter)
@@ -1180,5 +1186,4 @@ class MessageListPane(QWidget):
             return False
         self.list_view.scrollTo(idx, QListView.PositionAtTop)
         return True
-
 

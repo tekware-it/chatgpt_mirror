@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import sys
 import tempfile
@@ -46,6 +47,8 @@ from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument,
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -105,6 +108,12 @@ from mirror_widgets import (
     normalize_code_lang,
 )
 
+APP_DISPLAY_NAME = "ChatGPT Mirror"
+# Release automation can override this (for example from a Git tag in CI).
+APP_VERSION = os.environ.get("CHATGPT_MIRROR_VERSION", "dev")
+GITHUB_PROJECT_URL = "https://github.com/tekware-it/chatgpt_mirror"
+GITHUB_SPONSORS_URL = "https://github.com/sponsors/tekware-it"
+
 class MainWindow(QMainWindow):
     """One application tab: native mirror (left) + ChatGPT WebView (right).
 
@@ -130,7 +139,7 @@ class MainWindow(QMainWindow):
         self._offline_store = offline_store
         self.tab_id = (tab_id or uuid.uuid4().hex[:12]).strip()
         self.storage_db_file = (storage_db_file or "").strip() or None
-        self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
 
         self.model = MessageListModel(self)
@@ -190,6 +199,7 @@ class MainWindow(QMainWindow):
         self.left_pane.exportRequested.connect(self._on_export_requested)
         self.left_pane.exportDebugVisibleRequested.connect(self._on_export_debug_visible_requested)
         self.left_pane.exportPdfImagesDebugRequested.connect(self._on_export_pdf_images_debug_requested)
+        self.left_pane.aboutRequested.connect(self._show_about_dialog)
 
         splitter = QSplitter(Qt.Horizontal)  # Horizontal splitter => left/right panes.
         splitter.addWidget(self.left_pane)
@@ -205,6 +215,48 @@ class MainWindow(QMainWindow):
         self.web_view.titleChanged.connect(lambda _t: self._schedule_persist_offline_snapshot())
         if initial_url:
             self.web_view.setUrl(QUrl(initial_url))
+
+    def _show_about_dialog(self) -> None:
+        """Show the application About dialog with version and project links."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About")
+        dlg.setModal(True)
+        dlg.resize(520, 260)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title = QLabel(f"<b>{APP_DISPLAY_NAME}</b>")
+        title.setStyleSheet("QLabel { font-size: 16px; }")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Native ChatGPT DOM mirror with offline snapshots and export tools.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("QLabel { color: #374151; }")
+        layout.addWidget(subtitle)
+
+        details = QLabel(
+            "<p style='margin:0'>"
+            f"<b>Version:</b> <code>{html_escape(APP_VERSION)}</code><br>"
+            "Release builds should set this from the Git tag."
+            "</p>"
+            "<p style='margin-top:8px'>"
+            f"<a href='{html_escape(GITHUB_PROJECT_URL)}'>GitHub project page</a><br>"
+            f"<a href='{html_escape(GITHUB_SPONSORS_URL)}'>GitHub Sponsors</a>"
+            "</p>"
+        )
+        details.setTextFormat(Qt.RichText)
+        details.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        details.setOpenExternalLinks(True)
+        details.setWordWrap(True)
+        layout.addWidget(details, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=dlg)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec()
 
     def _create_new_tab_page(self):
         host = self._tabs_host
@@ -1173,7 +1225,7 @@ class TabbedMainWindow(QMainWindow):
     """
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ChatGPT Mirror (PySide6 MVP)")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
         self._profile_root = ensure_profile_root()
         self._data_root = ensure_data_root()
