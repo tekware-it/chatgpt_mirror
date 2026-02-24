@@ -4,11 +4,12 @@
 
 ChatGPT Mirror is a desktop app that lets you use `chatgpt.com` normally on the right side, while a native desktop viewer mirrors the rendered conversation on the left side.
 
-It reads only what is already visible in the page DOM (no OpenAI API usage, no private endpoint calls), then turns it into a fast native list with code blocks, copy actions, exports, and offline snapshots.
+It reads only what is already visible in the page DOM (no OpenAI API usage, no private endpoint calls), then turns it into a fast native list with code blocks, copy actions, exports, and offline snapshots. It also prunes older WebView DOM nodes to reduce lag on long chats and improve overall UX while keeping the native mirror as the source of truth.
 
 ## What It Is Good For
 
 - Reading long conversations in a smoother native viewer
+- Reducing WebView lag on long chats by pruning older DOM nodes
 - Copying messages and code blocks quickly
 - Exporting conversations to Markdown / JSON / PDF
 - Keeping local offline-native snapshots of tabs

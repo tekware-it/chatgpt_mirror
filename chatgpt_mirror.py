@@ -231,7 +231,11 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("QLabel { font-size: 16px; }")
         layout.addWidget(title)
 
-        subtitle = QLabel("Native ChatGPT DOM mirror with offline snapshots and export tools.")
+        subtitle = QLabel(
+            "Native ChatGPT DOM mirror with offline snapshots and export tools. "
+            "It reduces lag on long conversations by pruning WebView DOM nodes and "
+            "improves the reading/copying experience with a native viewer."
+        )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("QLabel { color: #374151; }")
         layout.addWidget(subtitle)
