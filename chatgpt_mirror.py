@@ -2470,73 +2470,12 @@ class MessageListPane(QWidget):
         )
 
         settings_menu = QMenu(self.settings_btn)
-        self.auto_scroll_action = QAction("Auto-scroll nuovi messaggi", self, checkable=True)
-        self.auto_scroll_action.setChecked(self._auto_scroll_enabled)
-        self.auto_scroll_action.toggled.connect(self.autoScrollChanged.emit)
-        settings_menu.addAction(self.auto_scroll_action)
 
-        self.web_to_native_action = QAction("Sync scroll Web -> Native", self, checkable=True)
-        self.web_to_native_action.setChecked(self._web_to_native_sync_enabled)
-        self.web_to_native_action.toggled.connect(self.webToNativeSyncChanged.emit)
-        settings_menu.addAction(self.web_to_native_action)
-
-        self.native_to_web_action = QAction("Sync scroll Native -> Web", self, checkable=True)
-        self.native_to_web_action.setChecked(self._native_to_web_sync_enabled)
-        self.native_to_web_action.toggled.connect(self.nativeToWebSyncChanged.emit)
-        settings_menu.addAction(self.native_to_web_action)
-
-        settings_menu.addSeparator()
-
-        keep_dom_menu = settings_menu.addMenu("KEEP_DOM (WebView)")
-        self.keep_dom_group = QActionGroup(self)
-        self.keep_dom_group.setExclusive(True)
-        for count in (30, 80, 150):
-            action = QAction(str(count), self, checkable=True)
-            action.setChecked(count == self._keep_dom_count)
-            action.triggered.connect(lambda checked=False, c=count: self.keepDomChanged.emit(c))
-            self.keep_dom_group.addAction(action)
-            keep_dom_menu.addAction(action)
-
-        code_block_menu = settings_menu.addMenu("Blocchi codice (Native)")
-        self.code_block_mode_group = QActionGroup(self)
-        self.code_block_mode_group.setExclusive(True)
-        code_mode_specs = [
-            ("Auto (collassa lunghi)", "auto"),
-            ("Espansi", "expanded"),
-            ("Espansione totale", "full"),
-        ]
-        for label, mode in code_mode_specs:
-            action = QAction(label, self, checkable=True)
-            action.setChecked(mode == self._code_block_display_mode)
-            action.triggered.connect(lambda checked=False, m=mode: self._set_code_block_display_mode(m))
-            self.code_block_mode_group.addAction(action)
-            code_block_menu.addAction(action)
-
-        rich_entity_images_action = QAction("Mostra rich-entity image (Native + export)", self, checkable=True)
-        rich_entity_images_action.setChecked(self._show_rich_entity_images)
-        rich_entity_images_action.toggled.connect(self._set_rich_entity_images_visible)
-        settings_menu.addAction(rich_entity_images_action)
-
-        gallery_images_action = QAction("Mostra gallery immagini (Native + export)", self, checkable=True)
-        gallery_images_action.setChecked(self._show_gallery_images)
-        gallery_images_action.toggled.connect(self._set_gallery_images_visible)
-        settings_menu.addAction(gallery_images_action)
-
-        restore_pruned_action = QAction("Consenti ripristino DOM pruned con doppio click", self, checkable=True)
-        restore_pruned_action.setChecked(self._restore_pruned_on_view)
-        restore_pruned_action.toggled.connect(self.restorePrunedOnViewChanged.emit)
-        settings_menu.addAction(restore_pruned_action)
-
-        scroll_sync_debug_action = QAction("Debug scroll sync (log)", self, checkable=True)
-        scroll_sync_debug_action.setChecked(self._scroll_sync_debug_enabled)
-        scroll_sync_debug_action.toggled.connect(self.scrollSyncDebugChanged.emit)
-        settings_menu.addAction(scroll_sync_debug_action)
-
-        browser_lang_menu = settings_menu.addMenu("Lingua browser")
+        browser_lang_menu = settings_menu.addMenu("Browser Language")
         self.browser_lang_group = QActionGroup(self)
         self.browser_lang_group.setExclusive(True)
 
-        lang_system = QAction("Sistema", self, checkable=True)
+        lang_system = QAction("System", self, checkable=True)
         lang_system.setChecked(self._browser_language_mode == "system")
         lang_system.triggered.connect(lambda checked=False: self.browserLanguageChanged.emit("system"))
         self.browser_lang_group.addAction(lang_system)
@@ -2548,13 +2487,7 @@ class MessageListPane(QWidget):
         self.browser_lang_group.addAction(lang_en)
         browser_lang_menu.addAction(lang_en)
 
-        settings_menu.addSeparator()
-
-        reset_action = QAction("Reset sessione", self)
-        reset_action.triggered.connect(self.resetSessionRequested.emit)
-        settings_menu.addAction(reset_action)
-
-        export_menu = settings_menu.addMenu("Esporta conversazione")
+        export_menu = settings_menu.addMenu("Export Conversation")
         export_md = QAction("Markdown (.md)", self)
         export_md.triggered.connect(lambda: self.exportRequested.emit("md"))
         export_menu.addAction(export_md)
@@ -2565,13 +2498,82 @@ class MessageListPane(QWidget):
         export_pdf.triggered.connect(lambda: self.exportRequested.emit("pdf"))
         export_menu.addAction(export_pdf)
 
-        debug_action = QAction("Debug blocco visibile (.txt)", self)
-        debug_action.triggered.connect(self.exportDebugVisibleRequested.emit)
-        settings_menu.addAction(debug_action)
+        code_block_menu = settings_menu.addMenu("Code Blocks (Native)")
+        self.code_block_mode_group = QActionGroup(self)
+        self.code_block_mode_group.setExclusive(True)
+        code_mode_specs = [
+            ("Auto (collapse long blocks)", "auto"),
+            ("Expanded", "expanded"),
+            ("Full expansion", "full"),
+        ]
+        for label, mode in code_mode_specs:
+            action = QAction(label, self, checkable=True)
+            action.setChecked(mode == self._code_block_display_mode)
+            action.triggered.connect(lambda checked=False, m=mode: self._set_code_block_display_mode(m))
+            self.code_block_mode_group.addAction(action)
+            code_block_menu.addAction(action)
 
-        pdf_img_debug_action = QAction("Debug PDF immagini (.txt)", self)
+        scroll_menu = settings_menu.addMenu("Scroll")
+        self.auto_scroll_action = QAction("Auto-scroll new messages", self, checkable=True)
+        self.auto_scroll_action.setChecked(self._auto_scroll_enabled)
+        self.auto_scroll_action.toggled.connect(self.autoScrollChanged.emit)
+        scroll_menu.addAction(self.auto_scroll_action)
+
+        self.web_to_native_action = QAction("Sync Web -> Native", self, checkable=True)
+        self.web_to_native_action.setChecked(self._web_to_native_sync_enabled)
+        self.web_to_native_action.toggled.connect(self.webToNativeSyncChanged.emit)
+        scroll_menu.addAction(self.web_to_native_action)
+
+        self.native_to_web_action = QAction("Sync Native -> Web", self, checkable=True)
+        self.native_to_web_action.setChecked(self._native_to_web_sync_enabled)
+        self.native_to_web_action.toggled.connect(self.nativeToWebSyncChanged.emit)
+        scroll_menu.addAction(self.native_to_web_action)
+
+        rich_entity_images_action = QAction("Show rich-entity images (Native + export)", self, checkable=True)
+        rich_entity_images_action.setChecked(self._show_rich_entity_images)
+        rich_entity_images_action.toggled.connect(self._set_rich_entity_images_visible)
+        settings_menu.addAction(rich_entity_images_action)
+
+        gallery_images_action = QAction("Show gallery images (Native + export)", self, checkable=True)
+        gallery_images_action.setChecked(self._show_gallery_images)
+        gallery_images_action.toggled.connect(self._set_gallery_images_visible)
+        settings_menu.addAction(gallery_images_action)
+
+        reset_action = QAction("Reset Session", self)
+        reset_action.triggered.connect(self.resetSessionRequested.emit)
+        settings_menu.addAction(reset_action)
+
+        settings_menu.addSeparator()
+
+        advanced_menu = settings_menu.addMenu("Advanced")
+
+        keep_dom_menu = advanced_menu.addMenu("KEEP_DOM (WebView)")
+        self.keep_dom_group = QActionGroup(self)
+        self.keep_dom_group.setExclusive(True)
+        for count in (30, 80, 150):
+            action = QAction(str(count), self, checkable=True)
+            action.setChecked(count == self._keep_dom_count)
+            action.triggered.connect(lambda checked=False, c=count: self.keepDomChanged.emit(c))
+            self.keep_dom_group.addAction(action)
+            keep_dom_menu.addAction(action)
+
+        restore_pruned_action = QAction("Allow pruned DOM restore on double-click", self, checkable=True)
+        restore_pruned_action.setChecked(self._restore_pruned_on_view)
+        restore_pruned_action.toggled.connect(self.restorePrunedOnViewChanged.emit)
+        advanced_menu.addAction(restore_pruned_action)
+
+        scroll_sync_debug_action = QAction("Debug scroll sync (log)", self, checkable=True)
+        scroll_sync_debug_action.setChecked(self._scroll_sync_debug_enabled)
+        scroll_sync_debug_action.toggled.connect(self.scrollSyncDebugChanged.emit)
+        advanced_menu.addAction(scroll_sync_debug_action)
+
+        debug_action = QAction("Debug visible block (.txt)", self)
+        debug_action.triggered.connect(self.exportDebugVisibleRequested.emit)
+        advanced_menu.addAction(debug_action)
+
+        pdf_img_debug_action = QAction("Debug PDF images (.txt)", self)
         pdf_img_debug_action.triggered.connect(self.exportPdfImagesDebugRequested.emit)
-        settings_menu.addAction(pdf_img_debug_action)
+        advanced_menu.addAction(pdf_img_debug_action)
 
         self.settings_btn.setMenu(settings_menu)
         header_row.addWidget(self.settings_btn, 0, Qt.AlignVCenter)
@@ -3887,10 +3889,10 @@ class TabbedMainWindow(QMainWindow):
             "QToolButton:hover { background: #eef2f7; }"
         )
         plus_menu = QMenu(self._tabs_plus_btn)
-        act_new_tab = QAction("Nuovo tab", self)
+        act_new_tab = QAction("New Tab", self)
         act_new_tab.triggered.connect(lambda: self.create_mirror_tab(url="https://chatgpt.com", switch=True))
         plus_menu.addAction(act_new_tab)
-        act_open_tab = QAction("Apri snapshot locale (.sqlite)…", self)
+        act_open_tab = QAction("Open Local Snapshot (.sqlite)…", self)
         act_open_tab.triggered.connect(self._open_snapshot_dialog)
         plus_menu.addAction(act_open_tab)
         self._tabs_plus_btn.setMenu(plus_menu)
