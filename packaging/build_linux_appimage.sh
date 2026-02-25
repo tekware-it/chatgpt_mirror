@@ -53,14 +53,37 @@ if command -v convert >/dev/null 2>&1; then
   convert -size 256x256 xc:'#2563eb' -fill white -gravity center -pointsize 80 -annotate 0 'CGM' \
     "$APPDIR/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png"
 else
-  # Create a tiny valid PNG placeholder only if ImageMagick is unavailable.
+  # Create a valid placeholder PNG using only Python stdlib if ImageMagick is unavailable.
   python3 - <<PY
 from pathlib import Path
-import base64
-png = base64.b64decode(
-    b'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6t0x0AAAAASUVORK5CYII='
+import struct
+import zlib
+
+out = Path(r"$APPDIR/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png")
+w, h = 256, 256
+
+# Solid blue-ish RGBA icon placeholder.
+r, g, b, a = 0x25, 0x63, 0xEB, 0xFF
+row = bytes([r, g, b, a]) * w
+raw = b"".join(b"\x00" + row for _ in range(h))  # filter byte 0 per row
+
+def chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + tag
+        + data
+        + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    )
+
+png = b"".join(
+    [
+        b"\x89PNG\r\n\x1a\n",
+        chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)),
+        chunk(b"IDAT", zlib.compress(raw, level=9)),
+        chunk(b"IEND", b""),
+    ]
 )
-Path(r"$APPDIR/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png").write_bytes(png)
+out.write_bytes(png)
 PY
 fi
 
@@ -83,4 +106,3 @@ else
 fi
 
 echo "Done. Check $DIST_DIR for the AppImage."
-
