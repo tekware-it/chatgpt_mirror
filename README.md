@@ -1,5 +1,8 @@
 # ChatGPT Mirror
 
+[![CI](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/ci.yml/badge.svg)](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/ci.yml)
+[![Release Builds](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/release-builds.yml/badge.svg)](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/release-builds.yml)
+[![Built with Codex](https://img.shields.io/badge/Built%20with-Codex-111111)](https://openai.com)
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-support-30363D?logo=githubsponsors&logoColor=EA4AAA)](https://github.com/sponsors/tekware-it)
 
 ChatGPT Mirror is a desktop app that lets you use `chatgpt.com` normally on the right side, while a native desktop viewer mirrors the rendered conversation on the left side.
