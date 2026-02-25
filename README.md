@@ -1,6 +1,12 @@
 # ChatGPT Mirror
 
 <p align="center">
+  <a href="https://github.com/tekware-it/chatgpt_mirror/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Latest%20Release-2563EB?style=for-the-badge&logo=github" alt="Download latest release">
+  </a>
+</p>
+
+<p align="center">
   <a href="docs/screenshot-main.png">
     <img src="docs/screenshot-main.png" alt="ChatGPT Mirror screenshot" width="1200">
   </a>
