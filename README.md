@@ -1,5 +1,11 @@
 # ChatGPT Mirror
 
+<p align="center">
+  <a href="docs/screenshot-main.png">
+    <img src="docs/screenshot-main.png" alt="ChatGPT Mirror screenshot" width="1200">
+  </a>
+</p>
+
 [![CI](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/ci.yml/badge.svg)](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/ci.yml)
 [![Release Builds](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/release-builds.yml/badge.svg)](https://github.com/tekware-it/chatgpt_mirror/actions/workflows/release-builds.yml)
 [![Built with Codex](https://img.shields.io/badge/Built%20with-Codex-111111)](https://openai.com)
