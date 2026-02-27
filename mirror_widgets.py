@@ -7,6 +7,7 @@ much easier to maintain.
 
 from __future__ import annotations
 
+import os
 import re
 from html import escape as html_escape
 from typing import Dict, Optional
@@ -34,6 +35,19 @@ from PySide6.QtCore import QUrl
 
 from mirror_models import Message, MessageListModel, MessagePart
 from mirror_storage import IMAGE_BYTES_CACHE
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    """Parse a boolean environment variable with a safe default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 def monospace_font() -> QFont:
     """Return the monospace font used for native code rendering."""
@@ -302,12 +316,26 @@ class ImagePartWidget(QWidget):
 
     _net_mgr: Optional[QNetworkAccessManager] = None
 
-    def __init__(self, image_url: str, alt: str = "", parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        image_url: str,
+        alt: str = "",
+        image_kind: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.image_url = (image_url or "").strip()
         self.alt = (alt or "").strip()
+        self.image_kind = (image_kind or "").strip().lower()
         self._pixmap: Optional[QPixmap] = None
         self._reply = None
+        self._show_badge = True
+        self._show_copy_url_btn = True
+        self._show_preview = True
+        if self.image_kind == "rich-entity":
+            self._show_copy_url_btn = _env_bool("CGM_RICH_ENTITY_SHOW_COPY_IMAGE_URL", True)
+            self._show_badge = _env_bool("CGM_RICH_ENTITY_SHOW_IMAGE_BADGE", True)
+            self._show_preview = _env_bool("CGM_RICH_ENTITY_SHOW_IMAGE_PREVIEW", True)
         self._build_ui()
         self._start_load()
 
@@ -325,16 +353,21 @@ class ImagePartWidget(QWidget):
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(6)
-        chip = QLabel("image")
-        chip.setStyleSheet(
-            "QLabel { background: #e7edf6; color: #2d3748; padding: 2px 8px; border-radius: 9px; font-size: 11px; }"
-        )
-        top.addWidget(chip)
+        if self._show_badge:
+            chip = QLabel(f'<a href="{html_escape(self.image_url)}">image</a>')
+            chip.setOpenExternalLinks(True)
+            chip.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            chip.setStyleSheet(
+                "QLabel { background: #e7edf6; color: #2d3748; padding: 2px 8px; border-radius: 9px; font-size: 11px; }"
+                "QLabel a { color: #2d3748; text-decoration: none; }"
+            )
+            top.addWidget(chip)
         top.addStretch(1)
-        copy_btn = QPushButton("Copy image URL")
-        copy_btn.setCursor(Qt.PointingHandCursor)
-        copy_btn.clicked.connect(lambda: self.copyRequested.emit(self.image_url))
-        top.addWidget(copy_btn)
+        if self._show_copy_url_btn:
+            copy_btn = QPushButton("Copy image URL")
+            copy_btn.setCursor(Qt.PointingHandCursor)
+            copy_btn.clicked.connect(lambda: self.copyRequested.emit(self.image_url))
+            top.addWidget(copy_btn)
         outer.addLayout(top)
 
         self.preview = QLabel(self.alt or "Image")
@@ -345,15 +378,10 @@ class ImagePartWidget(QWidget):
             "QLabel { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; color: #475569; }"
         )
         self.preview.setWordWrap(True)
-        outer.addWidget(self.preview)
+        if self._show_preview:
+            outer.addWidget(self.preview)
 
-        link_html = f'<a href="{html_escape(self.image_url)}">{html_escape(self.image_url)}</a>'
-        self.url_label = QLabel(link_html)
-        self.url_label.setOpenExternalLinks(True)
-        self.url_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        self.url_label.setWordWrap(True)
-        self.url_label.setStyleSheet("QLabel { color: #334155; font-size: 12px; }")
-        outer.addWidget(self.url_label)
+        self.url_label: Optional[QLabel] = None
 
     def _start_load(self) -> None:
         if not self.image_url:
@@ -402,6 +430,8 @@ class ImagePartWidget(QWidget):
 
     def _render_pixmap(self) -> None:
         if self._pixmap is None:
+            return
+        if not self._show_preview:
             return
         target_w = max(120, min(320, self.width() - 4))
         scaled = self._pixmap.scaledToWidth(target_w, Qt.SmoothTransformation)
@@ -804,7 +834,7 @@ class MessageRowWidget(QFrame):
                     code_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(code_widget)
                 elif part.type == "image" and self._is_image_part_visible(part):
-                    img_widget = ImagePartWidget(part.image_url, part.alt)
+                    img_widget = ImagePartWidget(part.image_url, part.alt, part.image_kind)
                     img_widget.copyRequested.connect(self._copy_code_cb)
                     img_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(img_widget)
@@ -1186,4 +1216,3 @@ class MessageListPane(QWidget):
             return False
         self.list_view.scrollTo(idx, QListView.PositionAtTop)
         return True
-
