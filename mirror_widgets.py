@@ -964,6 +964,14 @@ class MessageListPane(QWidget):
         export_pdf.triggered.connect(lambda: self.exportRequested.emit("pdf"))
         export_menu.addAction(export_pdf)
 
+        collapse_all_action = QAction("Collapse all", self)
+        collapse_all_action.triggered.connect(lambda: self._set_all_messages_collapsed(True))
+        settings_menu.addAction(collapse_all_action)
+
+        expand_all_action = QAction("Expand all", self)
+        expand_all_action.triggered.connect(lambda: self._set_all_messages_collapsed(False))
+        settings_menu.addAction(expand_all_action)
+
         code_block_menu = settings_menu.addMenu("Code Blocks (Native)")
         self.code_block_mode_group = QActionGroup(self)
         self.code_block_mode_group.setExclusive(True)
@@ -1225,6 +1233,10 @@ class MessageListPane(QWidget):
 
     def copy_code(self, code: str) -> None:
         QGuiApplication.clipboard().setText(code)
+
+    def _set_all_messages_collapsed(self, collapsed: bool) -> None:
+        for msg in self.model.messages_in_order():
+            self.model.set_collapsed(msg.key, collapsed)
 
     def top_visible_info(self) -> Optional[tuple[str, float]]:
         """Return the top visible message key plus in-row scroll progress [0..1]."""
