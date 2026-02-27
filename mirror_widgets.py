@@ -1226,29 +1226,58 @@ class MessageListPane(QWidget):
     def copy_code(self, code: str) -> None:
         QGuiApplication.clipboard().setText(code)
 
-    def top_visible_key(self) -> Optional[str]:
+    def top_visible_info(self) -> Optional[tuple[str, float]]:
+        """Return the top visible message key plus in-row scroll progress [0..1]."""
         viewport = self.list_view.viewport()
         probe_points = [QPoint(12, 12), QPoint(12, 32), QPoint(12, 60)]
         for p in probe_points:
             idx = self.list_view.indexAt(p)
             if idx.isValid():
                 msg = self.model.message_at_row(idx.row())
-                return msg.key if msg else None
+                if not msg:
+                    return None
+                rect = self.list_view.visualRect(idx)
+                h = max(1, rect.height())
+                progress = max(0.0, min(1.0, float(-rect.top()) / float(h)))
+                return (msg.key, progress)
         # Fallback: first visible row by geometry scan.
         for row in range(self.model.rowCount()):
             idx = self.model.index(row, 0)
             rect = self.list_view.visualRect(idx)
             if rect.isValid() and rect.bottom() >= 0:
                 msg = self.model.message_at_row(row)
-                return msg.key if msg else None
+                if not msg:
+                    return None
+                h = max(1, rect.height())
+                progress = max(0.0, min(1.0, float(-rect.top()) / float(h)))
+                return (msg.key, progress)
         return None
 
-    def scroll_key_to_top(self, key: str) -> bool:
+    def top_visible_key(self) -> Optional[str]:
+        info = self.top_visible_info()
+        return info[0] if info else None
+
+    def scroll_key_with_progress(self, key: str, progress: float = 0.0) -> bool:
         row = self.model.row_for_key(key)
         if row < 0:
             return False
         idx = self.model.index(row, 0)
         if not idx.isValid():
             return False
+        progress = max(0.0, min(1.0, float(progress or 0.0)))
         self.list_view.scrollTo(idx, QListView.PositionAtTop)
+        if progress > 0.0:
+            sb = self.list_view.verticalScrollBar()
+            rect = self.list_view.visualRect(idx)
+            row_h = rect.height() if rect.isValid() else 0
+            if row_h <= 0:
+                msg = self.model.message_at_row(row)
+                if msg is not None:
+                    row_h = max(1, msg.size_hint.height())
+            delta = int(round(progress * max(1, row_h)))
+            if delta > 0:
+                sb.setValue(sb.value() + delta)
         return True
+
+    def scroll_key_to_top(self, key: str) -> bool:
+        return self.scroll_key_with_progress(key, 0.0)

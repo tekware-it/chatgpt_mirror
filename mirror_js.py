@@ -759,9 +759,9 @@ JS_INJECTOR = r"""
     return document.scrollingElement || document.documentElement || document.body;
   }
 
-  function getTopVisibleKey() {
+  function getTopVisibleInfo() {
     var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-cgm-message-key]'));
-    if (!nodes.length) return '';
+    if (!nodes.length) return { key: '', progress: 0 };
     var scroller = getScrollContainer(nodes[0] || null);
     var scrollerRect = (scroller && scroller.getBoundingClientRect) ? scroller.getBoundingClientRect() : null;
     var topBound = scrollerRect ? scrollerRect.top : 0;
@@ -777,8 +777,12 @@ JS_INJECTOR = r"""
       best = n;
       if (rect.top >= topBound) break;
     }
-    if (!best) return '';
-    return best.getAttribute('data-cgm-message-key') || '';
+    if (!best) return { key: '', progress: 0 };
+    var key = best.getAttribute('data-cgm-message-key') || '';
+    var br = best.getBoundingClientRect();
+    var h = Math.max(1, Math.round(br.height || 1));
+    var progress = Math.max(0, Math.min(1, (topBound - br.top) / h));
+    return { key: key, progress: progress };
   }
 
   function pruneDom(messageNodes, keepDomCount, state) {
@@ -889,6 +893,7 @@ JS_INJECTOR = r"""
     state.pending = false;
     state.lastScanAt = 0;
     state.lastTopKeySent = '';
+    state.lastTopProgressSent = -1;
     state.scrollEmitPending = false;
     state.programmaticScrollUntil = 0;
 
@@ -916,14 +921,25 @@ JS_INJECTOR = r"""
 
     function emitTopKeyIfChanged(reason) {
       if (Date.now() < state.programmaticScrollUntil) return;
-      var key = getTopVisibleKey();
+      var info = getTopVisibleInfo();
+      var key = info && info.key ? info.key : '';
+      var progress = info && typeof info.progress === 'number' ? info.progress : 0;
       if (!key) return;
-      if (key === state.lastTopKeySent) return;
+      var progressChanged = Math.abs(progress - (state.lastTopProgressSent || 0)) >= 0.04;
+      if (key === state.lastTopKeySent && !progressChanged) return;
       state.lastTopKeySent = key;
+      state.lastTopProgressSent = progress;
       if (state.scrollSyncDebug) {
-        sendEvent({ type: 'scroll_debug', dir: 'web->native', stage: 'emit_top_key', key: key, reason: reason || 'web_scroll' });
+        sendEvent({
+          type: 'scroll_debug',
+          dir: 'web->native',
+          stage: 'emit_top_key',
+          key: key,
+          progress: progress,
+          reason: reason || 'web_scroll'
+        });
       }
-      sendEvent({ type: 'scroll_top_key', key: key, reason: reason || 'web_scroll' });
+      sendEvent({ type: 'scroll_top_key', key: key, progress: progress, reason: reason || 'web_scroll' });
     }
 
     function scanNow(reason) {
@@ -961,8 +977,11 @@ JS_INJECTOR = r"""
 
     state.scheduleScan = scheduleScan;
     state.scanNow = scanNow;
-    state.scrollToKey = function(key) {
+    state.scrollToKey = function(key, progress) {
       if (!key) return false;
+      progress = Number(progress || 0);
+      if (!isFinite(progress)) progress = 0;
+      progress = Math.max(0, Math.min(1, progress));
       var nodes = document.querySelectorAll('[data-cgm-message-key]');
       var node = null;
       for (var i = 0; i < nodes.length; i++) {
@@ -981,24 +1000,28 @@ JS_INJECTOR = r"""
       var isPlaceholder = false;
       try { isPlaceholder = node.matches && node.matches('[data-cgm-pruned-placeholder="1"]'); } catch (e) {}
       var topKeyBefore = '';
-      try { topKeyBefore = getTopVisibleKey() || ''; } catch (e) {}
+      try { topKeyBefore = (getTopVisibleInfo().key || ''); } catch (e) {}
       var scroller = getScrollContainer(node);
+      var nodeRect0 = node.getBoundingClientRect();
+      var nodeH = Math.max(1, Math.round(nodeRect0.height || 1));
+      var offsetInsideNode = Math.round(progress * nodeH);
       if (scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement) {
-        var top = node.getBoundingClientRect().top + (window.scrollY || window.pageYOffset || 0);
+        var top = node.getBoundingClientRect().top + (window.scrollY || window.pageYOffset || 0) + offsetInsideNode;
         window.scrollTo({ top: Math.max(0, top - 8), behavior: 'auto' });
       } else {
         var scRect = scroller.getBoundingClientRect();
-        var target = node.getBoundingClientRect().top - scRect.top + scroller.scrollTop - 8;
+        var target = node.getBoundingClientRect().top - scRect.top + scroller.scrollTop + offsetInsideNode - 8;
         scroller.scrollTop = Math.max(0, target);
       }
       if (state.scrollSyncDebug) {
         var topKeyAfter = '';
-        try { topKeyAfter = getTopVisibleKey() || ''; } catch (e) {}
+        try { topKeyAfter = (getTopVisibleInfo().key || ''); } catch (e) {}
         sendEvent({
           type: 'scroll_debug',
           dir: 'native->web',
           stage: 'scroll_to_key',
           targetKey: String(key),
+          targetProgress: progress,
           found: true,
           placeholder: !!isPlaceholder,
           topKeyBefore: topKeyBefore,
@@ -1075,5 +1098,4 @@ JS_INJECTOR = r"""
   return "chatgpt_mirror_bootstrap_requested";
 })();
 """
-
 

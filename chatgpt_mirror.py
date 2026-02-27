@@ -423,11 +423,19 @@ class MainWindow(QMainWindow):
         key = str(evt.get("key") or "")
         if not key:
             return
+        try:
+            progress = float(evt.get("progress", 0.0))
+        except Exception:
+            progress = 0.0
+        progress = max(0.0, min(1.0, progress))
         self._suppress_native_scroll_until = time.monotonic() + 0.35
-        ok = self.left_pane.scroll_key_to_top(key)
+        ok = self.left_pane.scroll_key_with_progress(key, progress)
         if self._scroll_sync_debug_enabled:
             reason = str(evt.get("reason") or "")
-            print(f"[scroll-sync] web->native key={key} reason={reason or '-'} ok={ok}")
+            print(
+                f"[scroll-sync] web->native key={key} progress={progress:.3f} "
+                f"reason={reason or '-'} ok={ok}"
+            )
 
     def _scroll_to_bottom(self) -> None:
         idx = self.model.index(max(0, self.model.rowCount() - 1), 0)
@@ -453,16 +461,17 @@ class MainWindow(QMainWindow):
 
     def _send_native_top_key_to_web(self) -> None:
         """Tell the WebView to scroll to the message currently visible at the top of the native list."""
-        key = self.left_pane.top_visible_key()
-        if not key:
+        top_info = self.left_pane.top_visible_info()
+        if not top_info:
             return
+        key, progress = top_info
         if self._scroll_sync_debug_enabled:
-            print(f"[scroll-sync] native->web request key={key}")
+            print(f"[scroll-sync] native->web request key={key} progress={progress:.3f}")
         self._ignore_web_scroll_events_until = time.monotonic() + 0.45
         script = (
             "(function(){"
             "if(window.__chatgptMirror && typeof window.__chatgptMirror.scrollToKey==='function'){"
-            f"window.__chatgptMirror.scrollToKey({json.dumps(key)});"
+            f"window.__chatgptMirror.scrollToKey({json.dumps(key)}, {progress:.6f});"
             "}"
             "})();"
         )
