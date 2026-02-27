@@ -50,15 +50,18 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListView,
     QMainWindow,
     QMessageBox,
+    QRadioButton,
     QPushButton,
     QPlainTextEdit,
     QMenu,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTextBrowser,
@@ -605,9 +608,17 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_export_requested(self, fmt: str) -> None:
         """Export the current conversation in the selected format."""
-        messages = self._messages_for_export()
-        if not messages:
+        all_messages = self._messages_for_export()
+        if not all_messages:
             QMessageBox.information(self, "Esporta", "Nessun messaggio da esportare.")
+            return
+        selected = self._choose_export_message_range(len(all_messages))
+        if selected is None:
+            return
+        start_idx, end_idx = selected
+        messages = all_messages[start_idx:end_idx]
+        if not messages:
+            QMessageBox.information(self, "Esporta", "Intervallo selezionato vuoto.")
             return
 
         base_name = self._default_export_basename()
@@ -659,6 +670,84 @@ class MainWindow(QMainWindow):
                 return
             self._export_pdf_from_messages(messages, path)
             return
+
+    def _choose_export_message_range(self, total_count: int) -> Optional[tuple[int, int]]:
+        """Ask whether export should include all messages or a numeric 1-based range."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export Range")
+        dlg.setModal(True)
+
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        info = QLabel(f"Messages available: {total_count}")
+        info.setStyleSheet("QLabel { color: #374151; }")
+        outer.addWidget(info)
+
+        all_radio = QRadioButton("All")
+        range_radio = QRadioButton("Range")
+        all_radio.setChecked(True)
+        outer.addWidget(all_radio)
+        outer.addWidget(range_radio)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(16, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        from_label = QLabel("From")
+        to_label = QLabel("To")
+        from_spin = QSpinBox()
+        from_spin.setRange(1, max(1, total_count))
+        from_spin.setValue(1)
+        to_spin = QSpinBox()
+        to_spin.setRange(1, max(1, total_count))
+        to_spin.setValue(max(1, total_count))
+        from_spin.setEnabled(False)
+        to_spin.setEnabled(False)
+        grid.addWidget(from_label, 0, 0)
+        grid.addWidget(from_spin, 0, 1)
+        grid.addWidget(to_label, 1, 0)
+        grid.addWidget(to_spin, 1, 1)
+        outer.addLayout(grid)
+
+        def _sync_range_enabled() -> None:
+            enabled = range_radio.isChecked()
+            from_spin.setEnabled(enabled)
+            to_spin.setEnabled(enabled)
+
+        all_radio.toggled.connect(_sync_range_enabled)
+        range_radio.toggled.connect(_sync_range_enabled)
+        _sync_range_enabled()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg)
+        outer.addWidget(buttons)
+
+        def _accept() -> None:
+            if not range_radio.isChecked():
+                dlg.accept()
+                return
+            f = int(from_spin.value())
+            t = int(to_spin.value())
+            if f > t:
+                QMessageBox.warning(dlg, "Invalid Range", '"From" must be <= "To".')
+                return
+            if f < 1 or t > total_count:
+                QMessageBox.warning(dlg, "Invalid Range", "Range is outside available messages.")
+                return
+            dlg.accept()
+
+        buttons.accepted.connect(_accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        if all_radio.isChecked():
+            return (0, total_count)
+        # Convert 1-based inclusive range to python slice [start:end)
+        start = int(from_spin.value()) - 1
+        end = int(to_spin.value())
+        return (start, end)
 
     def _messages_for_export(self) -> List[Message]:
         """Build the export message list after applying image visibility toggles."""
