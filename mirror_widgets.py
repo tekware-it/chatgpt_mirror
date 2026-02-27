@@ -13,7 +13,7 @@ from html import escape as html_escape
 from typing import Dict, Optional
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPixmap
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument, QSyntaxHighlighter
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,6 +48,10 @@ def _env_bool(name: str, default: bool = True) -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _scaled(value: int, zoom_percent: int) -> int:
+    return max(1, int(round(float(value) * float(zoom_percent) / 100.0)))
 
 def monospace_font() -> QFont:
     """Return the monospace font used for native code rendering."""
@@ -208,8 +212,10 @@ class MarkdownTextWidget(QTextBrowser):
 
     relayoutRequested = Signal()
 
-    def __init__(self, markdown_text: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, markdown_text: str, zoom_percent: int = 100, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._markdown_text = markdown_text or ""
+        self._zoom_percent = max(50, min(250, int(zoom_percent or 100)))
         self.setReadOnly(True)
         self.setOpenExternalLinks(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -218,43 +224,53 @@ class MarkdownTextWidget(QTextBrowser):
         self.setFocusPolicy(Qt.NoFocus)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet(
-            """
-            QTextBrowser {
-                background: transparent;
-                border: none;
-                color: #111827;
-                padding: 0;
-                margin: 0;
-            }
-            """
+            "QTextBrowser { background: transparent; border: none; color: #111827; padding: 0; margin: 0; }"
         )
 
+        self._apply_markdown_styles()
+        self._sync_height()
+        self.document().contentsChanged.connect(self._on_contents_changed)
+
+    def _apply_markdown_styles(self) -> None:
         doc = self.document()
         app_font = QApplication.font() if QApplication.instance() else QFont("Sans Serif", 10)
-        doc.setDefaultFont(app_font)
+        base_pt = max(8, int(round(app_font.pointSizeF() * float(self._zoom_percent) / 100.0)))
+        font = QFont(app_font)
+        font.setPointSize(base_pt)
+        self.setFont(font)
+        self.setStyleSheet(
+            f"QTextBrowser {{ background: transparent; border: none; color: #111827; padding: 0; margin: 0; font-size: {_scaled(13, self._zoom_percent)}px; }}"
+        )
+        doc.setDefaultFont(font)
         doc.setDefaultStyleSheet(
-            """
-            body { color: #111827; font-size: 13px; line-height: 1.35; }
-            p { margin: 0 0 8px 0; }
-            h1 { font-size: 22px; margin: 10px 0 8px 0; font-weight: 700; }
-            h2 { font-size: 19px; margin: 10px 0 7px 0; font-weight: 700; }
-            h3 { font-size: 17px; margin: 8px 0 6px 0; font-weight: 700; }
-            h4 { font-size: 15px; margin: 8px 0 6px 0; font-weight: 700; }
-            h5 { font-size: 14px; margin: 6px 0 4px 0; font-weight: 700; }
-            h6 { font-size: 13px; margin: 6px 0 4px 0; font-weight: 700; }
-            ul, ol { margin: 4px 0 8px 22px; }
-            li { margin: 2px 0; }
-            blockquote { color: #374151; border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; }
-            a { color: #1d4ed8; text-decoration: none; }
-            code { font-family: "DejaVu Sans Mono"; }
+            f"""
+            body {{ color: #111827; font-size: {_scaled(13, self._zoom_percent)}px; line-height: 1.35; }}
+            p {{ margin: 0 0 {_scaled(8, self._zoom_percent)}px 0; }}
+            h1 {{ font-size: {_scaled(22, self._zoom_percent)}px; margin: {_scaled(10, self._zoom_percent)}px 0 {_scaled(8, self._zoom_percent)}px 0; font-weight: 700; }}
+            h2 {{ font-size: {_scaled(19, self._zoom_percent)}px; margin: {_scaled(10, self._zoom_percent)}px 0 {_scaled(7, self._zoom_percent)}px 0; font-weight: 700; }}
+            h3 {{ font-size: {_scaled(17, self._zoom_percent)}px; margin: {_scaled(8, self._zoom_percent)}px 0 {_scaled(6, self._zoom_percent)}px 0; font-weight: 700; }}
+            h4 {{ font-size: {_scaled(15, self._zoom_percent)}px; margin: {_scaled(8, self._zoom_percent)}px 0 {_scaled(6, self._zoom_percent)}px 0; font-weight: 700; }}
+            h5 {{ font-size: {_scaled(14, self._zoom_percent)}px; margin: {_scaled(6, self._zoom_percent)}px 0 {_scaled(4, self._zoom_percent)}px 0; font-weight: 700; }}
+            h6 {{ font-size: {_scaled(13, self._zoom_percent)}px; margin: {_scaled(6, self._zoom_percent)}px 0 {_scaled(4, self._zoom_percent)}px 0; font-weight: 700; }}
+            ul, ol {{ margin: {_scaled(4, self._zoom_percent)}px 0 {_scaled(8, self._zoom_percent)}px {_scaled(22, self._zoom_percent)}px; }}
+            li {{ margin: {_scaled(2, self._zoom_percent)}px 0; }}
+            blockquote {{ color: #374151; border-left: {_scaled(3, self._zoom_percent)}px solid #cbd5e1; margin: {_scaled(8, self._zoom_percent)}px 0; padding-left: {_scaled(10, self._zoom_percent)}px; }}
+            a {{ color: #1d4ed8; text-decoration: none; }}
+            code {{ font-family: "DejaVu Sans Mono"; }}
             """
         )
         try:
-            self.setMarkdown(markdown_text or "")
+            self.setMarkdown(self._markdown_text)
         except Exception:
-            self.setPlainText(markdown_text or "")
+            self.setPlainText(self._markdown_text)
+
+    def set_zoom_percent(self, zoom_percent: int) -> None:
+        zoom_percent = max(50, min(250, int(zoom_percent or 100)))
+        if zoom_percent == self._zoom_percent:
+            return
+        self._zoom_percent = zoom_percent
+        self._apply_markdown_styles()
         self._sync_height()
-        doc.contentsChanged.connect(self._on_contents_changed)
 
     def _on_contents_changed(self) -> None:
         self._sync_height()
@@ -322,12 +338,14 @@ class ImagePartWidget(QWidget):
         image_url: str,
         alt: str = "",
         image_kind: str = "",
+        zoom_percent: int = 100,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.image_url = (image_url or "").strip()
         self.alt = (alt or "").strip()
         self.image_kind = (image_kind or "").strip().lower()
+        self._zoom_percent = max(50, min(250, int(zoom_percent or 100)))
         self._pixmap: Optional[QPixmap] = None
         self._reply = None
         self._show_badge = True
@@ -363,7 +381,7 @@ class ImagePartWidget(QWidget):
             chip.setOpenExternalLinks(True)
             chip.setTextInteractionFlags(Qt.TextBrowserInteraction)
             chip.setStyleSheet(
-                "QLabel { background: #e7edf6; color: #2d3748; padding: 2px 8px; border-radius: 9px; font-size: 11px; }"
+                f"QLabel {{ background: #e7edf6; color: #2d3748; padding: {_scaled(2, self._zoom_percent)}px {_scaled(8, self._zoom_percent)}px; border-radius: {_scaled(9, self._zoom_percent)}px; font-size: {_scaled(11, self._zoom_percent)}px; }}"
                 "QLabel a { color: #2d3748; text-decoration: none; }"
             )
             top.addWidget(chip)
@@ -455,13 +473,14 @@ class ImagePartWidget(QWidget):
             return
         if not self._show_preview:
             return
-        target_w = max(120, min(320, self.width() - 4))
+        target_w = max(_scaled(120, self._zoom_percent), min(_scaled(320, self._zoom_percent), self.width() - 4))
         scaled = self._pixmap.scaledToWidth(target_w, Qt.SmoothTransformation)
-        if scaled.height() > 220:
-            scaled = self._pixmap.scaled(target_w, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        max_h = _scaled(220, self._zoom_percent)
+        if scaled.height() > max_h:
+            scaled = self._pixmap.scaled(target_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
-        self.preview.setMinimumHeight(max(80, scaled.height() + 8))
-        self.preview.setMaximumHeight(max(90, scaled.height() + 8))
+        self.preview.setMinimumHeight(max(_scaled(80, self._zoom_percent), scaled.height() + _scaled(8, self._zoom_percent)))
+        self.preview.setMaximumHeight(max(_scaled(90, self._zoom_percent), scaled.height() + _scaled(8, self._zoom_percent)))
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -475,10 +494,11 @@ class ImagePartWidget(QWidget):
 class CodeFullTextWidget(QTextBrowser):
     relayoutRequested = Signal()
 
-    def __init__(self, code: str, lang: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, code: str, lang: str, zoom_percent: int = 100, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._code = code or ""
         self._lang = normalize_code_lang(lang or "")
+        self._zoom_percent = max(50, min(250, int(zoom_percent or 100)))
         self.setReadOnly(True)
         self.setOpenExternalLinks(False)
         self.setFrameShape(QFrame.NoFrame)
@@ -488,19 +508,22 @@ class CodeFullTextWidget(QTextBrowser):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setLineWrapMode(QTextBrowser.WidgetWidth)
         self.setStyleSheet(
-            """
-            QTextBrowser {
+            f"""
+            QTextBrowser {{
                 background: #0f172a;
                 color: #e5e7eb;
                 border: 1px solid #cbd5e1;
                 border-radius: 8px;
-                padding: 8px;
+                padding: {_scaled(8, self._zoom_percent)}px;
                 margin: 0;
-            }
+            }}
             """
         )
         doc = self.document()
-        doc.setDefaultFont(monospace_font())
+        font = monospace_font()
+        base_pt = font.pointSize() if font.pointSize() > 0 else 10
+        font.setPointSize(max(8, _scaled(base_pt, self._zoom_percent)))
+        doc.setDefaultFont(font)
         doc.setDocumentMargin(0)
         self.setPlainText(self._code)
         self._highlighter = SimpleCodeHighlighter(doc, self._lang)
@@ -542,11 +565,19 @@ class CodeBlockWidget(QWidget):
     copyRequested = Signal(str)
     relayoutRequested = Signal()
 
-    def __init__(self, code: str, lang: str, display_mode: str = "auto", parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        lang: str,
+        display_mode: str = "auto",
+        zoom_percent: int = 100,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.code = code
         self.lang = lang
         self._display_mode = (display_mode or "auto").strip().lower()
+        self._zoom_percent = max(50, min(250, int(zoom_percent or 100)))
         self._editor: Optional[QPlainTextEdit] = None
         self._full_view: Optional[CodeFullTextWidget] = None
         self._toggle_btn: Optional[QPushButton] = None
@@ -570,8 +601,8 @@ class CodeBlockWidget(QWidget):
         norm_lang = normalize_code_lang(self.lang or "")
         lang_label = QLabel(norm_lang or "code")
         lang_label.setStyleSheet(
-            "QLabel { background: #e7edf6; color: #2d3748; padding: 2px 8px; "
-            "border-radius: 9px; font-size: 11px; }"
+            f"QLabel {{ background: #e7edf6; color: #2d3748; padding: {_scaled(2, self._zoom_percent)}px {_scaled(8, self._zoom_percent)}px; "
+            f"border-radius: {_scaled(9, self._zoom_percent)}px; font-size: {_scaled(11, self._zoom_percent)}px; }}"
         )
         header.addWidget(lang_label)
         header.addStretch(1)
@@ -600,7 +631,10 @@ class CodeBlockWidget(QWidget):
         editor.setReadOnly(True)
         editor.setPlainText(self.code)
         editor.setLineWrapMode(QPlainTextEdit.NoWrap)
-        editor.setFont(monospace_font())
+        font = monospace_font()
+        base_pt = font.pointSize() if font.pointSize() > 0 else 10
+        font.setPointSize(max(8, _scaled(base_pt, self._zoom_percent)))
+        editor.setFont(font)
         editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         editor.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         editor.setFrameShape(QFrame.NoFrame)
@@ -613,7 +647,7 @@ class CodeBlockWidget(QWidget):
         self._editor = editor
         outer.addWidget(editor)
 
-        full_view = CodeFullTextWidget(self.code, self.lang)
+        full_view = CodeFullTextWidget(self.code, self.lang, self._zoom_percent)
         full_view.relayoutRequested.connect(self.relayoutRequested.emit)
         self._full_view = full_view
         outer.addWidget(full_view)
@@ -714,6 +748,7 @@ class MessageRowWidget(QFrame):
         self._toggle_collapse_cb = toggle_collapse_cb
         self._copy_code_cb = copy_code_cb
         self._code_block_display_mode = (code_block_display_mode or "auto").strip().lower()
+        self._zoom_percent = 100
         self._show_rich_entity_images = True
         self._show_gallery_images = True
         self._message: Optional[Message] = None
@@ -793,6 +828,14 @@ class MessageRowWidget(QFrame):
         self._index_display = display_index
         self._render()
 
+    def set_zoom_percent(self, zoom_percent: int) -> None:
+        zoom_percent = max(50, min(250, int(zoom_percent or 100)))
+        if zoom_percent == self._zoom_percent:
+            return
+        self._zoom_percent = zoom_percent
+        if self._message is not None:
+            self._render()
+
     def set_code_block_display_mode(self, mode: str) -> None:
         mode = (mode or "auto").strip().lower()
         if mode not in {"auto", "expanded", "full"}:
@@ -833,11 +876,19 @@ class MessageRowWidget(QFrame):
 
         self.role_badge.setText(msg.role_label())
         self.role_badge.setStyleSheet(
-            "QLabel { background: %s; color: %s; padding: 3px 8px; border-radius: 9px; font-weight: 600; }"
-            % (("#ecfdf5", "#065f46") if is_user else ("#e8f0ff", "#1e3a8a"))
+            "QLabel { background: %s; color: %s; padding: %dpx %dpx; border-radius: %dpx; font-weight: 600; font-size: %dpx; }"
+            % (
+                * ((("#ecfdf5", "#065f46") if is_user else ("#e8f0ff", "#1e3a8a"))),
+                _scaled(3, self._zoom_percent),
+                _scaled(8, self._zoom_percent),
+                _scaled(9, self._zoom_percent),
+                _scaled(12, self._zoom_percent),
+            )
         )
         self.index_label.setText(f"#{self._index_display}")
+        self.index_label.setStyleSheet(f"QLabel {{ color: #4b5563; font-size: {_scaled(12, self._zoom_percent)}px; }}")
         self.preview_label.setText(msg.preview_text(120))
+        self.preview_label.setStyleSheet(f"QLabel {{ color: #111827; font-size: {_scaled(13, self._zoom_percent)}px; }}")
         self.collapse_btn.setText("Expand" if msg.collapsed else "Collapse")
 
         self.preview_label.setVisible(msg.collapsed)
@@ -847,16 +898,21 @@ class MessageRowWidget(QFrame):
         if not msg.collapsed:
             for part in msg.parts:
                 if part.type == "text":
-                    text_widget = MarkdownTextWidget(part.text)
+                    text_widget = MarkdownTextWidget(part.text, self._zoom_percent)
                     text_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(text_widget)
                 elif part.type == "code":
-                    code_widget = CodeBlockWidget(part.code, part.lang, self._code_block_display_mode)
+                    code_widget = CodeBlockWidget(
+                        part.code,
+                        part.lang,
+                        self._code_block_display_mode,
+                        self._zoom_percent,
+                    )
                     code_widget.copyRequested.connect(self._copy_code_cb)
                     code_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(code_widget)
                 elif part.type == "image" and self._is_image_part_visible(part):
-                    img_widget = ImagePartWidget(part.image_url, part.alt, part.image_kind)
+                    img_widget = ImagePartWidget(part.image_url, part.alt, part.image_kind, self._zoom_percent)
                     img_widget.copyRequested.connect(self._copy_code_cb)
                     img_widget.relayoutRequested.connect(self._schedule_relayout)
                     self.expanded_layout.addWidget(img_widget)
@@ -912,6 +968,7 @@ class MessageListPane(QWidget):
         self._browser_language_mode = "system"
         self._show_rich_entity_images = True
         self._show_gallery_images = True
+        self._native_zoom_percent = 100
         self._build_ui()
         self._connect_model()
 
@@ -1082,6 +1139,10 @@ class MessageListPane(QWidget):
         self.list_view.viewport().installEventFilter(self)
         layout.addWidget(self.list_view, 1)
 
+        QShortcut(QKeySequence.ZoomIn, self, activated=lambda: self._change_native_zoom(+10))
+        QShortcut(QKeySequence.ZoomOut, self, activated=lambda: self._change_native_zoom(-10))
+        QShortcut(QKeySequence("Ctrl+0"), self, activated=lambda: self._set_native_zoom(100))
+
     def _connect_model(self) -> None:
         self.model.rowsInserted.connect(self._on_rows_inserted)
         self.model.dataChanged.connect(self._on_data_changed)
@@ -1133,6 +1194,7 @@ class MessageListPane(QWidget):
             copy_code_cb=self.copy_code,
             code_block_display_mode=self._code_block_display_mode,
         )
+        widget.set_zoom_percent(self._native_zoom_percent)
         widget.set_image_visibility(self._show_rich_entity_images, self._show_gallery_images)
         widget.relayoutRequested.connect(self._on_row_relayout_requested)
         self._widgets_by_key[msg.key] = widget
@@ -1215,11 +1277,38 @@ class MessageListPane(QWidget):
         for widget in self._widgets_by_key.values():
             self._apply_row_width(widget)
 
+    def _set_native_zoom(self, zoom_percent: int) -> None:
+        zoom_percent = max(50, min(250, int(zoom_percent or 100)))
+        if zoom_percent == self._native_zoom_percent:
+            return
+        self._native_zoom_percent = zoom_percent
+        self.header.setText(f"Native Mirror ({self._native_zoom_percent}%)")
+        for row in range(self.model.rowCount()):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            widget = self._widgets_by_key.get(msg.key)
+            if widget is not None:
+                widget.set_zoom_percent(self._native_zoom_percent)
+        self.list_view.doItemsLayout()
+
+    def _change_native_zoom(self, delta: int) -> None:
+        self._set_native_zoom(self._native_zoom_percent + int(delta or 0))
+
     def eventFilter(self, watched: QObject, event) -> bool:  # type: ignore[override]
-        if watched is self.list_view.viewport() and event.type() == QEvent.Resize:
-            self._apply_widths_to_all_rows()
-            # Width changes can change wrapping, so request a lazy relayout on visible rows.
-            QTimer.singleShot(0, self.list_view.doItemsLayout)
+        if watched is self.list_view.viewport():
+            if event.type() == QEvent.Resize:
+                self._apply_widths_to_all_rows()
+                # Width changes can change wrapping, so request a lazy relayout on visible rows.
+                QTimer.singleShot(0, self.list_view.doItemsLayout)
+            elif event.type() == QEvent.Wheel and hasattr(event, "modifiers"):
+                if event.modifiers() & Qt.ControlModifier:
+                    delta = event.angleDelta().y() if hasattr(event, "angleDelta") else 0
+                    if delta > 0:
+                        self._change_native_zoom(+10)
+                    elif delta < 0:
+                        self._change_native_zoom(-10)
+                    return True
         return super().eventFilter(watched, event)
 
     def copy_message(self, key: str) -> None:
