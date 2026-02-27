@@ -315,6 +315,7 @@ class ImagePartWidget(QWidget):
     relayoutRequested = Signal()
 
     _net_mgr: Optional[QNetworkAccessManager] = None
+    _use_firefox_headers: bool = True
 
     def __init__(
         self,
@@ -344,6 +345,10 @@ class ImagePartWidget(QWidget):
         if cls._net_mgr is None:
             cls._net_mgr = QNetworkAccessManager()
         return cls._net_mgr
+
+    @classmethod
+    def set_use_firefox_headers(cls, enabled: bool) -> None:
+        cls._use_firefox_headers = bool(enabled)
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -396,6 +401,23 @@ class ImagePartWidget(QWidget):
                 return
         try:
             req = QNetworkRequest(QUrl(self.image_url))
+            if self._use_firefox_headers:
+                req.setRawHeader(
+                    b"User-Agent",
+                    b"Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0",
+                )
+                req.setRawHeader(
+                    b"Accept",
+                    b"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                req.setRawHeader(b"Accept-Language", b"it-IT,it;q=0.8,en-US;q=0.5,en;q=0.3")
+                req.setRawHeader(b"Sec-GPC", b"1")
+                req.setRawHeader(b"Upgrade-Insecure-Requests", b"1")
+                req.setRawHeader(b"Sec-Fetch-Dest", b"document")
+                req.setRawHeader(b"Sec-Fetch-Mode", b"navigate")
+                req.setRawHeader(b"Sec-Fetch-Site", b"none")
+                req.setRawHeader(b"Sec-Fetch-User", b"?1")
+                req.setRawHeader(b"Priority", b"u=0, i")
             self._reply = self._manager().get(req)
             self._reply.finished.connect(self._on_reply_finished)
         except Exception:
@@ -865,6 +887,7 @@ class MessageListPane(QWidget):
     keepDomChanged = Signal(int)
     restorePrunedOnViewChanged = Signal(bool)
     scrollSyncDebugChanged = Signal(bool)
+    nativeImageFirefoxHeadersChanged = Signal(bool)
     browserLanguageChanged = Signal(str)
     resetSessionRequested = Signal()
     exportRequested = Signal(str)
@@ -884,6 +907,7 @@ class MessageListPane(QWidget):
         self._keep_dom_count = 30
         self._restore_pruned_on_view = False
         self._scroll_sync_debug_enabled = False
+        self._use_firefox_headers_for_native_img = True
         self._code_block_display_mode = "auto"
         self._browser_language_mode = "system"
         self._show_rich_entity_images = True
@@ -1008,6 +1032,11 @@ class MessageListPane(QWidget):
         scroll_sync_debug_action.setChecked(self._scroll_sync_debug_enabled)
         scroll_sync_debug_action.toggled.connect(self.scrollSyncDebugChanged.emit)
         advanced_menu.addAction(scroll_sync_debug_action)
+
+        firefox_headers_action = QAction("Use Firefox headers for native img", self, checkable=True)
+        firefox_headers_action.setChecked(self._use_firefox_headers_for_native_img)
+        firefox_headers_action.toggled.connect(self._set_native_image_firefox_headers)
+        advanced_menu.addAction(firefox_headers_action)
 
         debug_action = QAction("Debug visible block (.txt)", self)
         debug_action.triggered.connect(self.exportDebugVisibleRequested.emit)
@@ -1150,6 +1179,13 @@ class MessageListPane(QWidget):
 
     def show_gallery_images_enabled(self) -> bool:
         return self._show_gallery_images
+
+    def _set_native_image_firefox_headers(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._use_firefox_headers_for_native_img:
+            return
+        self._use_firefox_headers_for_native_img = enabled
+        self.nativeImageFirefoxHeadersChanged.emit(enabled)
 
     @Slot(str, QSize)
     def _on_row_relayout_requested(self, key: str, size_hint: QSize) -> None:

@@ -183,6 +183,8 @@ class MainWindow(QMainWindow):
         self._keep_dom_count = 30
         self._restore_pruned_on_view_enabled = False
         self._scroll_sync_debug_enabled = False
+        self._native_img_use_firefox_headers = True
+        ImagePartWidget.set_use_firefox_headers(self._native_img_use_firefox_headers)
         self._profile_root = profile_root
         self._persist_timer = QTimer(self)
         self._persist_timer.setSingleShot(True)
@@ -194,6 +196,7 @@ class MainWindow(QMainWindow):
         self.left_pane.keepDomChanged.connect(self._on_keep_dom_changed)
         self.left_pane.restorePrunedOnViewChanged.connect(self._on_restore_pruned_on_view_changed)
         self.left_pane.scrollSyncDebugChanged.connect(self._on_scroll_sync_debug_changed)
+        self.left_pane.nativeImageFirefoxHeadersChanged.connect(self._on_native_image_firefox_headers_changed)
         self.left_pane.browserLanguageChanged.connect(self._on_browser_language_changed)
         self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
         self.left_pane.exportRequested.connect(self._on_export_requested)
@@ -522,6 +525,13 @@ class MainWindow(QMainWindow):
             "})();"
         )
         self.web_view.page().runJavaScript(script)
+
+    @Slot(bool)
+    def _on_native_image_firefox_headers_changed(self, enabled: bool) -> None:
+        self._native_img_use_firefox_headers = bool(enabled)
+        ImagePartWidget.set_use_firefox_headers(self._native_img_use_firefox_headers)
+        # Rebuild rows so image widgets are recreated with the new request profile.
+        self.left_pane._refresh_indices_from(0)
 
     def _apply_browser_language_setting(self) -> None:
         mode = getattr(self, "_browser_language_mode", "system")
