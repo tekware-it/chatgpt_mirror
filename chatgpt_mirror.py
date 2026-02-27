@@ -612,10 +612,11 @@ class MainWindow(QMainWindow):
         if not all_messages:
             QMessageBox.information(self, "Esporta", "Nessun messaggio da esportare.")
             return
-        selected = self._choose_export_message_range(len(all_messages))
+        want_pdf_zoom = fmt.lower().strip() == "pdf"
+        selected = self._choose_export_message_range(len(all_messages), include_zoom=want_pdf_zoom)
         if selected is None:
             return
-        start_idx, end_idx = selected
+        start_idx, end_idx, zoom_percent = selected
         messages = all_messages[start_idx:end_idx]
         if not messages:
             QMessageBox.information(self, "Esporta", "Intervallo selezionato vuoto.")
@@ -668,10 +669,14 @@ class MainWindow(QMainWindow):
             )
             if not path:
                 return
-            self._export_pdf_from_messages(messages, path)
+            self._export_pdf_from_messages(messages, path, zoom_percent=zoom_percent)
             return
 
-    def _choose_export_message_range(self, total_count: int) -> Optional[tuple[int, int]]:
+    def _choose_export_message_range(
+        self,
+        total_count: int,
+        include_zoom: bool = False,
+    ) -> Optional[tuple[int, int, int]]:
         """Ask whether export should include all messages or a numeric 1-based range."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Export Range")
@@ -709,6 +714,16 @@ class MainWindow(QMainWindow):
         grid.addWidget(from_spin, 0, 1)
         grid.addWidget(to_label, 1, 0)
         grid.addWidget(to_spin, 1, 1)
+
+        zoom_spin: Optional[QSpinBox] = None
+        if include_zoom:
+            zoom_label = QLabel("Zoom (%)")
+            zoom_spin = QSpinBox()
+            zoom_spin.setRange(20, 300)
+            zoom_spin.setSingleStep(5)
+            zoom_spin.setValue(100)
+            grid.addWidget(zoom_label, 2, 0)
+            grid.addWidget(zoom_spin, 2, 1)
         outer.addLayout(grid)
 
         def _sync_range_enabled() -> None:
@@ -742,12 +757,13 @@ class MainWindow(QMainWindow):
 
         if dlg.exec() != QDialog.Accepted:
             return None
+        zoom = int(zoom_spin.value()) if zoom_spin is not None else 100
         if all_radio.isChecked():
-            return (0, total_count)
+            return (0, total_count, zoom)
         # Convert 1-based inclusive range to python slice [start:end)
         start = int(from_spin.value()) - 1
         end = int(to_spin.value())
-        return (start, end)
+        return (start, end, zoom)
 
     def _messages_for_export(self) -> List[Message]:
         """Build the export message list after applying image visibility toggles."""
@@ -930,7 +946,8 @@ class MainWindow(QMainWindow):
         except Exception:
             return src
 
-    def _conversation_as_html_for_pdf(self, messages: List[Message]) -> str:
+    def _conversation_as_html_for_pdf(self, messages: List[Message], zoom_percent: int = 100) -> str:
+        zoom_percent = max(20, min(300, int(zoom_percent or 100)))
         pygments_css = ""
         if PYGMENTS_AVAILABLE and HtmlFormatter:
             try:
@@ -980,6 +997,7 @@ class MainWindow(QMainWindow):
       font-size: 11pt;
       line-height: 1.38;
       margin: 0;
+      zoom: {zoom_percent}%;
     }}
     h1,h2,h3,h4,h5,h6 {{ color: #111827; }}
     p {{ margin: 0 0 8px 0; }}
@@ -1074,8 +1092,8 @@ class MainWindow(QMainWindow):
             doc.setPlainText(markdown_text)
         doc.print_(printer)
 
-    def _export_pdf_from_messages(self, messages: List[Message], path: str) -> None:
-        html = self._conversation_as_html_for_pdf(messages)
+    def _export_pdf_from_messages(self, messages: List[Message], path: str, zoom_percent: int = 100) -> None:
+        html = self._conversation_as_html_for_pdf(messages, zoom_percent=zoom_percent)
 
         # Prefer WebEngine's PDF renderer: much better support for HTML/CSS/images than QTextDocument/QPrinter.
         try:
