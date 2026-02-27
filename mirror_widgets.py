@@ -937,7 +937,7 @@ class MessageListPane(QWidget):
 
         settings_menu = QMenu(self.settings_btn)
 
-        browser_lang_menu = settings_menu.addMenu("Browser Language")
+        browser_lang_menu = QMenu("Browser Language", self)
         self.browser_lang_group = QActionGroup(self)
         self.browser_lang_group.setExclusive(True)
 
@@ -952,6 +952,22 @@ class MessageListPane(QWidget):
         lang_en.triggered.connect(lambda checked=False: self.browserLanguageChanged.emit("en"))
         self.browser_lang_group.addAction(lang_en)
         browser_lang_menu.addAction(lang_en)
+
+        scroll_menu = QMenu("Scroll", self)
+        self.auto_scroll_action = QAction("Auto-scroll new messages", self, checkable=True)
+        self.auto_scroll_action.setChecked(self._auto_scroll_enabled)
+        self.auto_scroll_action.toggled.connect(self.autoScrollChanged.emit)
+        scroll_menu.addAction(self.auto_scroll_action)
+
+        self.web_to_native_action = QAction("Sync Web -> Native", self, checkable=True)
+        self.web_to_native_action.setChecked(self._web_to_native_sync_enabled)
+        self.web_to_native_action.toggled.connect(self.webToNativeSyncChanged.emit)
+        scroll_menu.addAction(self.web_to_native_action)
+
+        self.native_to_web_action = QAction("Sync Native -> Web", self, checkable=True)
+        self.native_to_web_action.setChecked(self._native_to_web_sync_enabled)
+        self.native_to_web_action.toggled.connect(self.nativeToWebSyncChanged.emit)
+        scroll_menu.addAction(self.native_to_web_action)
 
         export_menu = settings_menu.addMenu("Export Conversation")
         export_md = QAction("Markdown (.md)", self)
@@ -987,22 +1003,6 @@ class MessageListPane(QWidget):
             self.code_block_mode_group.addAction(action)
             code_block_menu.addAction(action)
 
-        scroll_menu = settings_menu.addMenu("Scroll")
-        self.auto_scroll_action = QAction("Auto-scroll new messages", self, checkable=True)
-        self.auto_scroll_action.setChecked(self._auto_scroll_enabled)
-        self.auto_scroll_action.toggled.connect(self.autoScrollChanged.emit)
-        scroll_menu.addAction(self.auto_scroll_action)
-
-        self.web_to_native_action = QAction("Sync Web -> Native", self, checkable=True)
-        self.web_to_native_action.setChecked(self._web_to_native_sync_enabled)
-        self.web_to_native_action.toggled.connect(self.webToNativeSyncChanged.emit)
-        scroll_menu.addAction(self.web_to_native_action)
-
-        self.native_to_web_action = QAction("Sync Native -> Web", self, checkable=True)
-        self.native_to_web_action.setChecked(self._native_to_web_sync_enabled)
-        self.native_to_web_action.toggled.connect(self.nativeToWebSyncChanged.emit)
-        scroll_menu.addAction(self.native_to_web_action)
-
         rich_entity_images_action = QAction("Show rich-entity images (Native + export)", self, checkable=True)
         rich_entity_images_action.setChecked(self._show_rich_entity_images)
         rich_entity_images_action.toggled.connect(self._set_rich_entity_images_visible)
@@ -1013,13 +1013,9 @@ class MessageListPane(QWidget):
         gallery_images_action.toggled.connect(self._set_gallery_images_visible)
         settings_menu.addAction(gallery_images_action)
 
-        reset_action = QAction("Reset Session", self)
-        reset_action.triggered.connect(self.resetSessionRequested.emit)
-        settings_menu.addAction(reset_action)
-
-        settings_menu.addSeparator()
-
         advanced_menu = settings_menu.addMenu("Advanced")
+        advanced_menu.addMenu(browser_lang_menu)
+        advanced_menu.addMenu(scroll_menu)
 
         keep_dom_menu = advanced_menu.addMenu("KEEP_DOM (WebView)")
         self.keep_dom_group = QActionGroup(self)
@@ -1053,6 +1049,10 @@ class MessageListPane(QWidget):
         pdf_img_debug_action = QAction("Debug PDF images (.txt)", self)
         pdf_img_debug_action.triggered.connect(self.exportPdfImagesDebugRequested.emit)
         advanced_menu.addAction(pdf_img_debug_action)
+
+        reset_action = QAction("Reset Session", self)
+        reset_action.triggered.connect(self.resetSessionRequested.emit)
+        advanced_menu.addAction(reset_action)
 
         settings_menu.addSeparator()
         about_action = QAction("About", self)
