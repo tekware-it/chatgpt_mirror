@@ -46,6 +46,7 @@ from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPageLayout, 
 from PySide6.QtGui import QAction, QActionGroup, QTextCharFormat, QTextDocument, QSyntaxHighlighter
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QDialog,
     QDialogButtonBox,
@@ -625,7 +626,7 @@ class MainWindow(QMainWindow):
         selected = self._choose_export_message_range(len(all_messages), include_zoom=want_pdf_zoom)
         if selected is None:
             return
-        start_idx, end_idx, zoom_percent = selected
+        start_idx, end_idx, zoom_percent, show_link_urls = selected
         messages = all_messages[start_idx:end_idx]
         if not messages:
             QMessageBox.information(self, "Esporta", "Intervallo selezionato vuoto.")
@@ -678,14 +679,19 @@ class MainWindow(QMainWindow):
             )
             if not path:
                 return
-            self._export_pdf_from_messages(messages, path, zoom_percent=zoom_percent)
+            self._export_pdf_from_messages(
+                messages,
+                path,
+                zoom_percent=zoom_percent,
+                show_link_urls=show_link_urls,
+            )
             return
 
     def _choose_export_message_range(
         self,
         total_count: int,
         include_zoom: bool = False,
-    ) -> Optional[tuple[int, int, int]]:
+    ) -> Optional[tuple[int, int, int, bool]]:
         """Ask whether export should include all messages or a numeric 1-based range."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Export Range")
@@ -735,6 +741,12 @@ class MainWindow(QMainWindow):
             grid.addWidget(zoom_spin, 2, 1)
         outer.addLayout(grid)
 
+        links_checkbox: Optional[QCheckBox] = None
+        if include_zoom:
+            links_checkbox = QCheckBox("Write link URLs in full")
+            links_checkbox.setChecked(False)
+            outer.addWidget(links_checkbox)
+
         def _sync_range_enabled() -> None:
             enabled = range_radio.isChecked()
             from_spin.setEnabled(enabled)
@@ -767,12 +779,13 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return None
         zoom = int(zoom_spin.value()) if zoom_spin is not None else 100
+        show_link_urls = bool(links_checkbox.isChecked()) if links_checkbox is not None else False
         if all_radio.isChecked():
-            return (0, total_count, zoom)
+            return (0, total_count, zoom, show_link_urls)
         # Convert 1-based inclusive range to python slice [start:end)
         start = int(from_spin.value()) - 1
         end = int(to_spin.value())
-        return (start, end, zoom)
+        return (start, end, zoom, show_link_urls)
 
     def _messages_for_export(self) -> List[Message]:
         """Build the export message list after applying image visibility toggles."""
@@ -881,7 +894,7 @@ class MainWindow(QMainWindow):
                         lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
-    def _markdown_fragment_to_html(self, markdown_text: str) -> str:
+    def _markdown_fragment_to_html(self, markdown_text: str, show_link_urls: bool = False) -> str:
         marker_pattern = re.compile(
             r'<!--\s*cgm-thumb\s+src="([^"]+)"(?:\s+alt="([^"]*)")?\s*-->',
             flags=re.IGNORECASE,
@@ -904,7 +917,15 @@ class MainWindow(QMainWindow):
             doc.setPlainText(md)
         html = doc.toHtml()
         m = re.search(r"<body[^>]*>(.*)</body>", html, flags=re.IGNORECASE | re.DOTALL)
-        return m.group(1) if m else html
+        body_html = m.group(1) if m else html
+        if show_link_urls:
+            body_html = re.sub(
+                r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>',
+                r'<a href="\1">\2</a><span class="link-url"> (\1)</span>',
+                body_html,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        return body_html
 
     def _code_html_for_pdf(self, code: str, lang: str) -> str:
         code = code.rstrip("\n")
@@ -955,7 +976,12 @@ class MainWindow(QMainWindow):
         except Exception:
             return src
 
-    def _conversation_as_html_for_pdf(self, messages: List[Message], zoom_percent: int = 100) -> str:
+    def _conversation_as_html_for_pdf(
+        self,
+        messages: List[Message],
+        zoom_percent: int = 100,
+        show_link_urls: bool = False,
+    ) -> str:
         zoom_percent = max(20, min(300, int(zoom_percent or 100)))
         pygments_css = ""
         if PYGMENTS_AVAILABLE and HtmlFormatter:
@@ -978,7 +1004,9 @@ class MainWindow(QMainWindow):
                 if part.type == "text":
                     txt = part.text.strip()
                     if txt:
-                        blocks.append(f'<div class="text-part">{self._markdown_fragment_to_html(txt)}</div>')
+                        blocks.append(
+                            f'<div class="text-part">{self._markdown_fragment_to_html(txt, show_link_urls=show_link_urls)}</div>'
+                        )
                 elif part.type == "code":
                     blocks.append(self._code_html_for_pdf(part.code, part.lang))
                 elif part.type == "image":
@@ -986,8 +1014,9 @@ class MainWindow(QMainWindow):
                     if src:
                         alt = html_escape((part.alt or "").strip() or "image")
                         pdf_src = self._pdf_local_thumb_url(src)
+                        link_label = html_escape(src) if show_link_urls else "link"
                         blocks.append(
-                            f'<div class="image-part"><a href="{html_escape(src)}">{alt}</a><br>'
+                            f'<div class="image-part"><a href="{html_escape(src)}">{link_label}</a><br>'
                             f'<img src="{html_escape(pdf_src)}" alt="{alt}" class="inline-image"></div>'
                         )
             blocks.append("</section>")
@@ -1079,6 +1108,11 @@ class MainWindow(QMainWindow):
       margin: 6px 0;
     }}
     a {{ color: #1d4ed8; text-decoration: none; }}
+    .link-url {{
+      color: #4b5563;
+      font-size: 8.5pt;
+      word-break: break-all;
+    }}
     {pygments_css}
   </style>
 </head>
@@ -1101,8 +1135,18 @@ class MainWindow(QMainWindow):
             doc.setPlainText(markdown_text)
         doc.print_(printer)
 
-    def _export_pdf_from_messages(self, messages: List[Message], path: str, zoom_percent: int = 100) -> None:
-        html = self._conversation_as_html_for_pdf(messages, zoom_percent=zoom_percent)
+    def _export_pdf_from_messages(
+        self,
+        messages: List[Message],
+        path: str,
+        zoom_percent: int = 100,
+        show_link_urls: bool = False,
+    ) -> None:
+        html = self._conversation_as_html_for_pdf(
+            messages,
+            zoom_percent=zoom_percent,
+            show_link_urls=show_link_urls,
+        )
 
         # Prefer WebEngine's PDF renderer: much better support for HTML/CSS/images than QTextDocument/QPrinter.
         try:
