@@ -1,3 +1,4 @@
 PySide6
 PySide6-Addons
 Pygments
+psutil

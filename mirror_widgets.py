@@ -965,6 +965,7 @@ class MessageListPane(QWidget):
     exportPdfImagesDebugRequested = Signal()
     richEntityImagesVisibleChanged = Signal(bool)
     galleryImagesVisibleChanged = Signal(bool)
+    backgroundTabsPolicyChanged = Signal(str)
     aboutRequested = Signal()
 
     def __init__(self, model: MessageListModel, parent: Optional[QWidget] = None) -> None:
@@ -983,6 +984,7 @@ class MessageListPane(QWidget):
         self._browser_language_mode = "system"
         self._show_rich_entity_images = True
         self._show_gallery_images = True
+        self._background_tabs_policy = "frozen"
         self._native_zoom_percent = 100
         self._zoom_apply_timer = QTimer(self)
         self._zoom_apply_timer.setSingleShot(True)
@@ -1097,6 +1099,24 @@ class MessageListPane(QWidget):
         advanced_menu = settings_menu.addMenu("Advanced")
         advanced_menu.addMenu(browser_lang_menu)
         advanced_menu.addMenu(scroll_menu)
+
+        bg_tabs_menu = advanced_menu.addMenu("Background Web Tabs")
+        self._bg_tabs_policy_group = QActionGroup(self)
+        self._bg_tabs_policy_group.setExclusive(True)
+        bg_specs = [
+            ("Active (no throttling)", "active"),
+            ("Frozen", "frozen"),
+            ("Discarded (lowest memory)", "discarded"),
+        ]
+        for label, policy in bg_specs:
+            action = QAction(label, self, checkable=True)
+            action.setData(policy)
+            action.setChecked(policy == self._background_tabs_policy)
+            action.triggered.connect(
+                lambda checked=False, p=policy: self.backgroundTabsPolicyChanged.emit(p)
+            )
+            self._bg_tabs_policy_group.addAction(action)
+            bg_tabs_menu.addAction(action)
 
         keep_dom_menu = advanced_menu.addMenu("KEEP_DOM (WebView)")
         self.keep_dom_group = QActionGroup(self)
@@ -1297,6 +1317,20 @@ class MessageListPane(QWidget):
 
     def show_gallery_images_enabled(self) -> bool:
         return self._show_gallery_images
+
+    def set_background_tabs_policy(self, policy: str) -> None:
+        policy = (policy or "frozen").strip().lower()
+        if policy not in {"active", "frozen", "discarded"}:
+            policy = "frozen"
+        self._background_tabs_policy = policy
+        group = getattr(self, "_bg_tabs_policy_group", None)
+        if group is None:
+            return
+        for action in group.actions():
+            data = str(action.data() or "frozen")
+            action.blockSignals(True)
+            action.setChecked(data == policy)
+            action.blockSignals(False)
 
     def _set_native_image_firefox_headers(self, enabled: bool) -> None:
         enabled = bool(enabled)

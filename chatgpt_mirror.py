@@ -111,6 +111,16 @@ from mirror_storage import IMAGE_BYTES_CACHE, OfflineStore, ensure_data_root, en
 from mirror_web import MirrorWebPage, WebBridge
 
 try:
+    import psutil
+
+    PSUTIL_AVAILABLE = True
+    PSUTIL_IMPORT_ERROR = ""
+except Exception:
+    psutil = None  # type: ignore[assignment]
+    PSUTIL_AVAILABLE = False
+    PSUTIL_IMPORT_ERROR = "import error"
+
+try:
     from pygments import highlight as pygments_highlight
     from pygments.formatters import HtmlFormatter
     from pygments.lexers import get_lexer_by_name
@@ -149,6 +159,7 @@ APP_VERSION = os.environ.get("CHATGPT_MIRROR_VERSION", "dev")
 GITHUB_PROJECT_URL = "https://github.com/tekware-it/chatgpt_mirror"
 GITHUB_SPONSORS_URL = "https://github.com/sponsors/tekware-it"
 PERF_LOG_ENABLED = False
+JS_MEM_LOG_ENABLED = False
 
 
 def perf_log(msg: str) -> None:
@@ -193,6 +204,7 @@ class MainWindow(QMainWindow):
         initial_url: Optional[str] = "https://chatgpt.com",
         defer_web_load: bool = False,
         restore_snapshot_on_create: bool = True,
+        js_mem_log: bool = False,
     ) -> None:
         super().__init__()
         self._tabs_host = tabs_host
@@ -212,6 +224,10 @@ class MainWindow(QMainWindow):
         self._restore_done_cb: Optional[Callable[[], None]] = None
         self._restore_chunk_size = 80
         self._restore_tick_delay_ms = 8
+        self._js_mem_log_enabled = bool(js_mem_log)
+        self._js_mem_log_timer = QTimer(self)
+        self._js_mem_log_timer.setSingleShot(False)
+        self._js_mem_log_timer.timeout.connect(self._log_web_js_memory_snapshot)
         # Tab title updates stay locked until page load succeeds.
         self._tab_title_locked = True
         self._tab_title_lock_seq = 0
@@ -282,6 +298,7 @@ class MainWindow(QMainWindow):
         self.left_pane.restorePrunedOnViewChanged.connect(self._on_restore_pruned_on_view_changed)
         self.left_pane.scrollSyncDebugChanged.connect(self._on_scroll_sync_debug_changed)
         self.left_pane.nativeImageFirefoxHeadersChanged.connect(self._on_native_image_firefox_headers_changed)
+        self.left_pane.backgroundTabsPolicyChanged.connect(self._on_background_tabs_policy_changed)
         self.left_pane.browserLanguageChanged.connect(self._on_browser_language_changed)
         self.left_pane.resetSessionRequested.connect(self._on_reset_session_requested)
         self.left_pane.exportRequested.connect(self._on_export_requested)
@@ -302,6 +319,11 @@ class MainWindow(QMainWindow):
             self._snapshot_restored = True
 
         self._apply_browser_language_setting()
+        if self._tabs_host is not None and hasattr(self._tabs_host, "background_tabs_policy"):
+            try:
+                self.left_pane.set_background_tabs_policy(self._tabs_host.background_tabs_policy())  # type: ignore[attr-defined]
+            except Exception:
+                pass
         self.web_view.urlChanged.connect(lambda _u: self._schedule_persist_offline_snapshot())
         self.web_view.titleChanged.connect(lambda _t: self._schedule_persist_offline_snapshot())
         if (not self._defer_web_load) and initial_url:
@@ -313,6 +335,9 @@ class MainWindow(QMainWindow):
             self.left_pane.trigger_viewport_hydration()
         except Exception:
             pass
+        if self._js_mem_log_enabled and not self._js_mem_log_timer.isActive():
+            self._js_mem_log_timer.start(5000)
+            QTimer.singleShot(800, self._log_web_js_memory_snapshot)
         if self._defer_web_load and self._pending_initial_url:
             perf_log(f"ensure_activated tab={self.tab_id} load_url_start")
             self._defer_web_load = False
@@ -389,6 +414,73 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(800, self._apply_keep_dom_setting_to_web)
         QTimer.singleShot(900, self._apply_restore_pruned_on_view_setting_to_web)
         QTimer.singleShot(1000, self._apply_scroll_sync_debug_setting_to_web)
+        if self._js_mem_log_enabled and not self._js_mem_log_timer.isActive():
+            self._js_mem_log_timer.start(5000)
+            QTimer.singleShot(800, self._log_web_js_memory_snapshot)
+
+    def _log_web_js_memory_snapshot(self) -> None:
+        """Print periodic JS memory/DOM stats for leak diagnostics."""
+        if not self._js_mem_log_enabled:
+            return
+        print(f"[js-mem] tick tab={self.tab_id}", flush=True)
+        js = (
+            "(function(){"
+            "  var out={};"
+            "  try {"
+            "    var pm=(window.performance&&window.performance.memory)?window.performance.memory:null;"
+            "    out.used=pm&&pm.usedJSHeapSize?pm.usedJSHeapSize:0;"
+            "    out.total=pm&&pm.totalJSHeapSize?pm.totalJSHeapSize:0;"
+            "    out.limit=pm&&pm.jsHeapSizeLimit?pm.jsHeapSizeLimit:0;"
+            "  } catch(e) { out.used=0; out.total=0; out.limit=0; }"
+            "  try { out.domNodes=document.getElementsByTagName('*').length||0; } catch(e){ out.domNodes=0; }"
+            "  try {"
+            "    var s=window.__chatgptMirror||{};"
+            "    out.hashSize=s.hashByKey&&typeof s.hashByKey.size==='number'?s.hashByKey.size:0;"
+            "    out.prunedCache=s.prunedNodeCache&&typeof s.prunedNodeCache.size==='number'?s.prunedNodeCache.size:0;"
+            "    out.placeholders=s.placeholderByKey&&typeof s.placeholderByKey.size==='number'?s.placeholderByKey.size:0;"
+            "    out.keepDom=s.keepDom||0;"
+            "  } catch(e){ out.hashSize=0; out.prunedCache=0; out.placeholders=0; out.keepDom=0; }"
+            "  try { out.url=String(location.href||''); } catch(e){ out.url=''; }"
+            "  try { return JSON.stringify(out); } catch(e) { return ''; }"
+            "})();"
+        )
+
+        def _cb(obj) -> None:
+            payload = None
+            if isinstance(obj, dict):
+                payload = obj
+            elif isinstance(obj, str):
+                s = obj.strip()
+                if s:
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, dict):
+                            payload = parsed
+                    except Exception:
+                        payload = None
+            if not isinstance(payload, dict):
+                print(f"[js-mem] callback type={type(obj).__name__} value={repr(obj)[:180]}", flush=True)
+                return
+            used = int(payload.get("used") or 0) // (1024 * 1024)
+            total = int(payload.get("total") or 0) // (1024 * 1024)
+            limit = int(payload.get("limit") or 0) // (1024 * 1024)
+            dom_nodes = int(payload.get("domNodes") or 0)
+            hash_size = int(payload.get("hashSize") or 0)
+            pruned = int(payload.get("prunedCache") or 0)
+            placeholders = int(payload.get("placeholders") or 0)
+            keep_dom = int(payload.get("keepDom") or 0)
+            url = str(payload.get("url") or "")
+            print(
+                "[js-mem] "
+                f"tab={self.tab_id} heap={used}/{total}MB limit={limit}MB "
+                f"dom={dom_nodes} hash={hash_size} pruned={pruned} "
+                f"ph={placeholders} keepDom={keep_dom} url={url}"
+            , flush=True)
+
+        try:
+            self.web_view.page().runJavaScript(js, _cb)
+        except Exception:
+            pass
 
     @Slot(str)
     def on_delta_received(self, json_string: str) -> None:
@@ -821,6 +913,15 @@ class MainWindow(QMainWindow):
     def _on_native_image_firefox_headers_changed(self, enabled: bool) -> None:
         self._native_img_use_firefox_headers = bool(enabled)
         ImagePartWidget.set_use_firefox_headers(self._native_img_use_firefox_headers)
+
+    def _on_background_tabs_policy_changed(self, policy: str) -> None:
+        host = self._tabs_host
+        if host is None or not hasattr(host, "set_background_tabs_policy"):
+            return
+        try:
+            host.set_background_tabs_policy(policy)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         # Rebuild rows so image widgets are recreated with the new request profile.
         self.left_pane._refresh_indices_from(0)
 
@@ -1675,9 +1776,24 @@ class TabbedMainWindow(QMainWindow):
 
     It owns the shared WebEngine profile (single login session) and the tab manifest.
     """
-    def __init__(self, startup_progress_cb: Optional[Callable[[int, int, str], None]] = None) -> None:
+    def __init__(
+        self,
+        startup_progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        mem_accurate: bool = False,
+        js_mem_log: bool = False,
+    ) -> None:
         super().__init__()
         self._startup_progress_cb = startup_progress_cb
+        self._mem_accurate_requested = bool(mem_accurate)
+        self._js_mem_log_enabled = bool(js_mem_log)
+        self._background_tabs_policy = "frozen"
+        self._mem_use_pss = False
+        self._mem_proc = None
+        self._mem_label: Optional[QLabel] = None
+        self._mem_timer = QTimer(self)
+        self._mem_timer.setSingleShot(False)
+        self._mem_timer.timeout.connect(self._update_memory_status)
+        self._last_mem_breakdown_log_at = 0.0
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
         self._profile_root = ensure_profile_root()
@@ -1720,12 +1836,239 @@ class TabbedMainWindow(QMainWindow):
         self._snapshot_save_timer = QTimer(self)
         self._snapshot_save_timer.setSingleShot(True)
         self._snapshot_save_timer.timeout.connect(self._persist_all_tabs_now)
+        self._init_memory_monitor()
 
         self._emit_startup_progress(1, 5, "Initializing profile...")
         self._restore_tabs_from_disk()
         if self.tabs.count() == 0:
             self.create_mirror_tab(url="https://chatgpt.com", switch=True)
+        self._apply_tab_lifecycle_states()
         self._emit_startup_progress(5, 5, "Ready")
+
+    def _init_memory_monitor(self) -> None:
+        """Create a permanent status-bar widget showing native/web memory usage."""
+        global PSUTIL_AVAILABLE, PSUTIL_IMPORT_ERROR, psutil
+        if not PSUTIL_AVAILABLE:
+            # Retry import at runtime in case environment changed after module import.
+            try:
+                import importlib
+
+                psutil = importlib.import_module("psutil")  # type: ignore[assignment]
+                PSUTIL_AVAILABLE = True
+                PSUTIL_IMPORT_ERROR = ""
+            except Exception as exc:
+                PSUTIL_IMPORT_ERROR = str(exc) or "psutil unavailable"
+        if not PSUTIL_AVAILABLE:
+            self._mem_label = QLabel("Native: N/A | Web: N/A | Total: N/A")
+            self._mem_label.setToolTip(f"psutil not available: {PSUTIL_IMPORT_ERROR}")
+            self.statusBar().addPermanentWidget(self._mem_label)
+            return
+        try:
+            self._mem_proc = psutil.Process(os.getpid())  # type: ignore[union-attr]
+        except Exception:
+            self._mem_proc = None
+        self._mem_use_pss = bool(self._mem_accurate_requested and sys.platform.startswith("linux"))
+        mode = "PSS" if self._mem_use_pss else "RSS"
+        self._mem_label = QLabel("Native: -- MB | Web: -- MB | Total: -- MB")
+        self._mem_label.setToolTip(f"Memory monitor mode: {mode}")
+        self.statusBar().addPermanentWidget(self._mem_label)
+        self._update_memory_status()
+        self._mem_timer.start(1000)
+
+    def _pss_bytes_for_pid(self, pid: int) -> Optional[int]:
+        """Best-effort Linux PSS reader from /proc/<pid>/smaps_rollup."""
+        if not sys.platform.startswith("linux"):
+            return None
+        try:
+            path = Path(f"/proc/{int(pid)}/smaps_rollup")
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"^Pss:\s+(\d+)\s+kB$", txt, flags=re.MULTILINE)
+            if not m:
+                return None
+            return int(m.group(1)) * 1024
+        except Exception:
+            return None
+
+    def _format_mb(self, value_bytes: int) -> str:
+        return f"{(max(0, int(value_bytes)) / (1024.0 * 1024.0)):.0f}"
+
+    def _update_memory_status(self) -> None:
+        label = self._mem_label
+        proc = self._mem_proc
+        if label is None or proc is None or not PSUTIL_AVAILABLE:
+            return
+        try:
+            children = proc.children(recursive=True)
+        except Exception:
+            children = []
+
+        web_children = []
+        for child in children:
+            try:
+                name = (child.name() or "").lower()
+            except Exception:
+                name = ""
+            cmdline = ""
+            if not name:
+                try:
+                    cmdline = " ".join(child.cmdline()).lower()
+                except Exception:
+                    cmdline = ""
+            if "qtwebengineprocess" in name or "qtwebengineprocess" in cmdline:
+                web_children.append(child)
+
+        native_bytes = 0
+        web_bytes = 0
+        mode = "RSS"
+
+        if self._mem_use_pss:
+            native_pss = self._pss_bytes_for_pid(proc.pid)
+            web_pss_vals = [self._pss_bytes_for_pid(ch.pid) for ch in web_children]
+            if native_pss is not None and all(v is not None for v in web_pss_vals):
+                native_bytes = int(native_pss)
+                web_bytes = int(sum(int(v or 0) for v in web_pss_vals))
+                mode = "PSS"
+            else:
+                self._mem_use_pss = False
+
+        if mode != "PSS":
+            try:
+                native_bytes = int(proc.memory_info().rss)
+            except Exception:
+                native_bytes = 0
+            total_web = 0
+            for child in web_children:
+                try:
+                    total_web += int(child.memory_info().rss)
+                except Exception:
+                    pass
+            web_bytes = total_web
+            mode = "RSS"
+
+        total_bytes = native_bytes + web_bytes
+        label.setText(
+            f"Native: {self._format_mb(native_bytes)} MB | "
+            f"Web: {self._format_mb(web_bytes)} MB | "
+            f"Total: {self._format_mb(total_bytes)} MB"
+        )
+        label.setToolTip(f"Memory monitor mode: {mode}")
+        if self._js_mem_log_enabled:
+            print(
+                f"[mem] mode={mode} "
+                f"Native: {self._format_mb(native_bytes)} MB | "
+                f"Web: {self._format_mb(web_bytes)} MB | "
+                f"Total: {self._format_mb(total_bytes)} MB",
+                flush=True,
+            )
+            now = time.time()
+            if now - self._last_mem_breakdown_log_at >= 5.0:
+                self._last_mem_breakdown_log_at = now
+                self._log_web_process_breakdown(web_children, mode)
+
+    def _web_process_kind(self, child) -> str:
+        """Classify a QtWebEngine child process by Chromium --type."""
+        try:
+            cmd = " ".join(child.cmdline())
+        except Exception:
+            cmd = ""
+        m = re.search(r"--type=([a-zA-Z0-9_-]+)", cmd)
+        if m:
+            return m.group(1).lower()
+        return "unknown"
+
+    def background_tabs_policy(self) -> str:
+        return self._background_tabs_policy
+
+    def set_background_tabs_policy(self, policy: str) -> None:
+        policy = (policy or "frozen").strip().lower()
+        if policy not in {"active", "frozen", "discarded"}:
+            policy = "frozen"
+        if policy == self._background_tabs_policy:
+            return
+        self._background_tabs_policy = policy
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if isinstance(pane, MainWindow):
+                try:
+                    pane.left_pane.set_background_tabs_policy(policy)
+                except Exception:
+                    pass
+        self._apply_tab_lifecycle_states()
+        self.schedule_manifest_save()
+
+    def _log_web_process_breakdown(self, web_children: List[object], mode: str) -> None:
+        """Emit per-process-type memory usage to explain WebEngine growth."""
+        if not web_children:
+            return
+        buckets: Dict[str, Dict[str, int]] = {}
+        for child in web_children:
+            kind = self._web_process_kind(child)
+            try:
+                pid = int(child.pid)
+            except Exception:
+                pid = 0
+            if mode == "PSS":
+                b = self._pss_bytes_for_pid(pid) if pid else None
+                if b is None:
+                    try:
+                        b = int(child.memory_info().rss)
+                    except Exception:
+                        b = 0
+            else:
+                try:
+                    b = int(child.memory_info().rss)
+                except Exception:
+                    b = 0
+            slot = buckets.setdefault(kind, {"count": 0, "bytes": 0})
+            slot["count"] += 1
+            slot["bytes"] += int(b or 0)
+        parts = []
+        for kind, data in sorted(buckets.items(), key=lambda kv: kv[1]["bytes"], reverse=True):
+            mb = self._format_mb(int(data["bytes"]))
+            parts.append(f"{kind}:{data['count']}p/{mb}MB")
+        if parts:
+            print(f"[mem-web] mode={mode} " + " | ".join(parts), flush=True)
+
+    def _apply_tab_lifecycle_states(self) -> None:
+        """Keep background WebEngine tabs frozen to limit renderer memory growth."""
+        enum = getattr(QWebEnginePage, "LifecycleState", None)
+        if enum is None:
+            return
+        active_state = getattr(enum, "Active", None)
+        frozen_state = getattr(enum, "Frozen", None)
+        discarded_state = getattr(enum, "Discarded", None)
+        if active_state is None or frozen_state is None:
+            return
+        current = self.tabs.currentIndex()
+        policy = (self._background_tabs_policy or "frozen").strip().lower()
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if not isinstance(pane, MainWindow):
+                continue
+            page = pane.web_view.page()
+            if page is None or not hasattr(page, "setLifecycleState"):
+                continue
+            if i == current or policy == "active":
+                target = active_state
+                target_name = "Active"
+            elif policy == "discarded" and discarded_state is not None:
+                target = discarded_state
+                target_name = "Discarded"
+            else:
+                target = frozen_state
+                target_name = "Frozen"
+            try:
+                cur_state = page.lifecycleState() if hasattr(page, "lifecycleState") else None
+                if cur_state != target:
+                    page.setLifecycleState(target)
+                    if self._js_mem_log_enabled:
+                        print(
+                            f"[lifecycle] tab={getattr(pane, 'tab_id', '?')} idx={i} "
+                            f"policy={policy} state={target_name}",
+                            flush=True,
+                        )
+            except Exception:
+                continue
 
     def _emit_startup_progress(self, current: int, total: int, message: str) -> None:
         cb = self._startup_progress_cb
@@ -1759,6 +2102,7 @@ class TabbedMainWindow(QMainWindow):
             initial_url=url,
             defer_web_load=defer_web_load,
             restore_snapshot_on_create=restore_snapshot_on_create,
+            js_mem_log=self._js_mem_log_enabled,
         )
         idx = self.tabs.addTab(pane, "Nuovo tab")
         saved_tab_title = ""
@@ -1785,6 +2129,7 @@ class TabbedMainWindow(QMainWindow):
         if switch:
             self.tabs.setCurrentIndex(idx)
             pane.ensure_activated()
+        self._apply_tab_lifecycle_states()
         self.schedule_manifest_save()
         return pane
 
@@ -1797,6 +2142,7 @@ class TabbedMainWindow(QMainWindow):
                 self._restore_current_tab_with_progress()
             else:
                 pane.ensure_activated()
+        self._apply_tab_lifecycle_states()
         self.schedule_manifest_save()
         perf_log(f"tab_changed idx={self.tabs.currentIndex()} end elapsed_ms={int((time.perf_counter()-t0)*1000)}")
 
@@ -1846,6 +2192,7 @@ class TabbedMainWindow(QMainWindow):
             initial_url=widget.url or "https://chatgpt.com",
             defer_web_load=True,
             restore_snapshot_on_create=False,
+            js_mem_log=self._js_mem_log_enabled,
         )
         shown = (widget.title or "ChatGPT")
         shown = shown if len(shown) <= 28 else (shown[:27].rstrip() + "…")
@@ -2059,6 +2406,7 @@ class TabbedMainWindow(QMainWindow):
         self.tabs.removeTab(index)
         if w is not None:
             w.deleteLater()
+        self._apply_tab_lifecycle_states()
         self.schedule_manifest_save()
 
     def schedule_manifest_save(self, delay_ms: int = 300) -> None:
@@ -2099,7 +2447,11 @@ class TabbedMainWindow(QMainWindow):
                 )
         try:
             self._offline_store.save_manifest(
-                {"current_index": max(0, self.tabs.currentIndex()), "tabs": tabs_payload}
+                {
+                    "current_index": max(0, self.tabs.currentIndex()),
+                    "background_tabs_policy": self._background_tabs_policy,
+                    "tabs": tabs_payload,
+                }
             )
         except Exception:
             pass
@@ -2120,6 +2472,9 @@ class TabbedMainWindow(QMainWindow):
             manifest = self._offline_store.load_manifest()
         except Exception:
             manifest = {"tabs": [], "current_index": 0}
+        loaded_policy = str(manifest.get("background_tabs_policy") or "frozen").strip().lower()
+        if loaded_policy in {"active", "frozen", "discarded"}:
+            self._background_tabs_policy = loaded_policy
         tabs = manifest.get("tabs") or []
         try:
             current_idx = int(manifest.get("current_index") or 0)
@@ -2227,8 +2582,22 @@ def main() -> int:
         action="store_true",
         help="Enable performance logs for tab switch/restore debugging.",
     )
+    parser.add_argument(
+        "--mem-accurate",
+        action="store_true",
+        help="Use Linux PSS (if available) for memory monitor; otherwise automatic RSS fallback.",
+    )
+    parser.add_argument(
+        "--js-mem-log",
+        action="store_true",
+        help="Print periodic JS/WebView memory diagnostics to stdout.",
+    )
     args, qt_args = parser.parse_known_args(sys.argv[1:])
     PERF_LOG_ENABLED = bool(args.perf_log or os.environ.get("CGM_PERF_LOG", "").strip() == "1")
+    mem_accurate = bool(args.mem_accurate or os.environ.get("CGM_MEM_ACCURATE", "").strip() == "1")
+    js_mem_log = bool(args.js_mem_log or os.environ.get("CGM_JS_MEM_LOG", "").strip() == "1")
+    if js_mem_log:
+        print("[js-mem] enabled", flush=True)
 
     app = QApplication([sys.argv[0], *qt_args])
     perf_log("app_start")
@@ -2247,7 +2616,7 @@ def main() -> int:
         """
     )
 
-    window = TabbedMainWindow()
+    window = TabbedMainWindow(mem_accurate=mem_accurate, js_mem_log=js_mem_log)
     window.show()
     perf_log("main_window_shown")
     return app.exec()

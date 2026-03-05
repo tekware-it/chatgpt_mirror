@@ -53,13 +53,6 @@ Each app tab contains both panes.
 
 The `...` button in the Native Mirror header opens the settings menu.
 
-### Browser Language
-
-- `System`
-- `English`
-
-This controls the WebView browser language (Accept-Language) reported to `chatgpt.com`.
-
 ### Export Conversation
 
 - `Markdown (.md)`
@@ -74,12 +67,6 @@ Default export file names use the current chat title when available.
 - `Expanded`
 - `Full expansion`
 
-### Scroll
-
-- `Auto-scroll new messages`
-- `Sync Web -> Native`
-- `Sync Native -> Web`
-
 ### Image Display Toggles
 
 - `Show rich-entity images (Native + export)`
@@ -93,11 +80,25 @@ Clears WebView session/cookies/cache (best effort) and reloads `chatgpt.com`.
 
 ### Advanced
 
+- `Browser Language`
+  - `System`
+  - `English`
+- `Scroll`
+  - `Auto-scroll new messages`
+  - `Sync Web -> Native`
+  - `Sync Native -> Web`
+- `Background Web Tabs`
+  - `Active (no throttling)`
+  - `Frozen`
+  - `Discarded (lowest memory)`
 - `KEEP_DOM (WebView)` pruning level
 - `Allow pruned DOM restore on double-click`
 - `Debug scroll sync (log)`
 - `Debug visible block (.txt)`
 - `Debug PDF images (.txt)`
+
+`Background Web Tabs` controls `QWebEnginePage` lifecycle state for inactive tabs.  
+`Discarded` provides the lowest memory footprint (inactive tabs are unloaded and restored on activation).
 
 ### About
 
@@ -213,5 +214,9 @@ See `packaging/README.md` for PyInstaller + AppImage/Windows/macOS build scripts
 
 - The app extracts content from the rendered ChatGPT DOM using injected JavaScript (`QtWebEngine` + `QWebChannel` / console fallback).
 - ChatGPT DOM selectors are best-effort and may need updates over time.
+- Built-in memory monitor in status bar: `Native | Web | Total`.
+- Optional diagnostics:
+  - `--mem-accurate` uses Linux PSS (fallback RSS when unavailable).
+  - `--js-mem-log` prints JS DOM/heap stats and WebEngine per-process memory breakdown (`renderer`, `zygote`, ...).
 - No OpenAI API is used.
 - No private endpoints are called by the app.
