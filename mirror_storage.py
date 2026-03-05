@@ -293,8 +293,33 @@ class OfflineStore:
             conn.close()
         return final_path.name
 
-    def load_tab_snapshot(self, tab_id: str, db_file: Optional[str] = None) -> Optional[dict]:
-        """Load one tab snapshot and repopulate the shared in-memory image cache."""
+    def load_tab_page_state(self, tab_id: str, db_file: Optional[str] = None) -> Optional[dict]:
+        """Load only page metadata for one tab snapshot (no messages, no image blobs)."""
+        db_path = self.db_path_for_tab(tab_id, db_file)
+        if not db_path.exists():
+            return None
+        conn = self._connect(tab_id, db_path.name)
+        try:
+            page = {k: v for k, v in conn.execute("SELECT key, value FROM page_state")}
+            return page
+        finally:
+            conn.close()
+
+    def load_tab_snapshot(
+        self,
+        tab_id: str,
+        db_file: Optional[str] = None,
+        *,
+        preload_images: bool = True,
+        preload_image_limit: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Load one tab snapshot and optionally warm the shared in-memory image cache.
+
+        Notes:
+        - Loading many image BLOBs can block the UI for large chats.
+        - `preload_images=False` skips BLOB hydration entirely.
+        - `preload_image_limit` bounds the number of image rows copied to memory.
+        """
         db_path = self.db_path_for_tab(tab_id, db_file)
         if not db_path.exists():
             return None
@@ -318,12 +343,20 @@ class OfflineStore:
                         "collapsed": bool(collapsed),
                     }
                 )
-            for url, data in conn.execute("SELECT url, data FROM image_cache"):
-                if isinstance(url, str) and data:
-                    try:
-                        IMAGE_BYTES_CACHE[url] = bytes(data)
-                    except Exception:
-                        pass
+            if preload_images:
+                if preload_image_limit is None:
+                    img_iter = conn.execute("SELECT url, data FROM image_cache")
+                else:
+                    img_iter = conn.execute(
+                        "SELECT url, data FROM image_cache LIMIT ?",
+                        (max(0, int(preload_image_limit)),),
+                    )
+                for url, data in img_iter:
+                    if isinstance(url, str) and data:
+                        try:
+                            IMAGE_BYTES_CACHE[url] = bytes(data)
+                        except Exception:
+                            pass
             return {"page_state": page, "messages": messages}
         finally:
             conn.close()

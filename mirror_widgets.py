@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from html import escape as html_escape
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QSize, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QKeySequence, QPixmap, QShortcut
@@ -389,16 +390,19 @@ class ImagePartWidget(QWidget):
         if self._show_copy_url_btn:
             copy_btn = QPushButton("Copy image URL")
             copy_btn.setCursor(Qt.PointingHandCursor)
+            copy_btn.setStyleSheet(
+                f"QPushButton {{ font-size: {_scaled(12, self._zoom_percent)}px; padding: {_scaled(3, self._zoom_percent)}px {_scaled(8, self._zoom_percent)}px; }}"
+            )
             copy_btn.clicked.connect(lambda: self.copyRequested.emit(self.image_url))
             top.addWidget(copy_btn)
         outer.addLayout(top)
 
         self.preview = QLabel(self.alt or "Image")
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumHeight(80)
-        self.preview.setMaximumHeight(220)
+        self.preview.setMinimumHeight(_scaled(80, self._zoom_percent))
+        self.preview.setMaximumHeight(_scaled(300, self._zoom_percent))
         self.preview.setStyleSheet(
-            "QLabel { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; color: #475569; }"
+            f"QLabel {{ background: #f8fafc; border: 1px solid #cbd5e1; border-radius: {_scaled(8, self._zoom_percent)}px; color: #475569; font-size: {_scaled(12, self._zoom_percent)}px; }}"
         )
         self.preview.setWordWrap(True)
         if self._show_preview:
@@ -473,9 +477,9 @@ class ImagePartWidget(QWidget):
             return
         if not self._show_preview:
             return
-        target_w = max(_scaled(120, self._zoom_percent), min(_scaled(320, self._zoom_percent), self.width() - 4))
+        target_w = max(_scaled(140, self._zoom_percent), min(_scaled(420, self._zoom_percent), self.width() - 4))
         scaled = self._pixmap.scaledToWidth(target_w, Qt.SmoothTransformation)
-        max_h = _scaled(220, self._zoom_percent)
+        max_h = _scaled(300, self._zoom_percent)
         if scaled.height() > max_h:
             scaled = self._pixmap.scaled(target_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
@@ -516,6 +520,7 @@ class CodeFullTextWidget(QTextBrowser):
                 border-radius: 8px;
                 padding: {_scaled(8, self._zoom_percent)}px;
                 margin: 0;
+                font-size: {_scaled(12, self._zoom_percent)}px;
             }}
             """
         )
@@ -609,6 +614,9 @@ class CodeBlockWidget(QWidget):
 
         copy_btn = QPushButton("Copy code")
         copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.setStyleSheet(
+            f"QPushButton {{ font-size: {_scaled(12, self._zoom_percent)}px; padding: {_scaled(3, self._zoom_percent)}px {_scaled(8, self._zoom_percent)}px; }}"
+        )
         copy_btn.clicked.connect(lambda: self.copyRequested.emit(self.code))
         header.addWidget(copy_btn)
 
@@ -617,10 +625,16 @@ class CodeBlockWidget(QWidget):
         if self._is_long_block:
             self._toggle_btn = QPushButton("Expand")
             self._toggle_btn.setCursor(Qt.PointingHandCursor)
+            self._toggle_btn.setStyleSheet(
+                f"QPushButton {{ font-size: {_scaled(12, self._zoom_percent)}px; padding: {_scaled(3, self._zoom_percent)}px {_scaled(8, self._zoom_percent)}px; }}"
+            )
             self._toggle_btn.clicked.connect(self._toggle_collapsed)
             header.addWidget(self._toggle_btn)
             self._total_btn = QPushButton("Total expand")
             self._total_btn.setCursor(Qt.PointingHandCursor)
+            self._total_btn.setStyleSheet(
+                f"QPushButton {{ font-size: {_scaled(12, self._zoom_percent)}px; padding: {_scaled(3, self._zoom_percent)}px {_scaled(8, self._zoom_percent)}px; }}"
+            )
             self._total_btn.clicked.connect(self._toggle_total_expand)
             header.addWidget(self._total_btn)
         self._apply_display_mode_defaults()
@@ -639,8 +653,8 @@ class CodeBlockWidget(QWidget):
         editor.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         editor.setFrameShape(QFrame.NoFrame)
         editor.setStyleSheet(
-            "QPlainTextEdit { background: #0f172a; color: #e5e7eb; "
-            "border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px; }"
+            f"QPlainTextEdit {{ background: #0f172a; color: #e5e7eb; "
+            f"border: 1px solid #cbd5e1; border-radius: {_scaled(8, self._zoom_percent)}px; padding: {_scaled(8, self._zoom_percent)}px; font-size: {_scaled(12, self._zoom_percent)}px; }}"
         )
         # Lightweight syntax highlighting based on extracted language label.
         self._highlighter = SimpleCodeHighlighter(editor.document(), norm_lang)
@@ -957,6 +971,7 @@ class MessageListPane(QWidget):
         super().__init__(parent)
         self.model = model
         self._widgets_by_key: Dict[str, MessageRowWidget] = {}
+        self._pending_zoom_keys: Set[str] = set()
         self._auto_scroll_enabled = True
         self._web_to_native_sync_enabled = True
         self._native_to_web_sync_enabled = True
@@ -969,6 +984,15 @@ class MessageListPane(QWidget):
         self._show_rich_entity_images = True
         self._show_gallery_images = True
         self._native_zoom_percent = 100
+        self._zoom_apply_timer = QTimer(self)
+        self._zoom_apply_timer.setSingleShot(True)
+        self._zoom_apply_timer.timeout.connect(self._apply_pending_zoom_near_viewport)
+        self._row_hydrate_timer = QTimer(self)
+        self._row_hydrate_timer.setSingleShot(True)
+        self._row_hydrate_timer.timeout.connect(self._hydrate_rows_near_viewport)
+        self._layout_recalc_timer = QTimer(self)
+        self._layout_recalc_timer.setSingleShot(True)
+        self._last_scroll_ts = 0.0
         self._build_ui()
         self._connect_model()
 
@@ -1137,6 +1161,8 @@ class MessageListPane(QWidget):
             "QListView { background: #f5f7fb; border: 1px solid #dbe2ea; border-radius: 10px; padding: 6px; }"
         )
         self.list_view.viewport().installEventFilter(self)
+        self.list_view.verticalScrollBar().valueChanged.connect(self._on_list_scrolled_for_zoom_update)
+        self._layout_recalc_timer.timeout.connect(self.list_view.doItemsLayout)
         layout.addWidget(self.list_view, 1)
 
         QShortcut(QKeySequence.ZoomIn, self, activated=lambda: self._change_native_zoom(+10))
@@ -1148,16 +1174,37 @@ class MessageListPane(QWidget):
         self.model.dataChanged.connect(self._on_data_changed)
 
     def _on_rows_inserted(self, parent: QModelIndex, first: int, last: int) -> None:
-        for row in range(first, last + 1):
-            self._ensure_row_widget(row)
+        # Avoid creating all row widgets during large restores: hydrate lazily near viewport.
+        self._schedule_row_hydration(0)
+        # Fast path for append-heavy streams/restores: refresh only inserted rows.
+        row_count = self.model.rowCount()
+        if first > 0 and last == (row_count - 1):
+            self._refresh_indices_range(first, last)
+            return
+        # Fallback for rare middle insertions: preserve index correctness.
         self._refresh_indices_from(first)
 
     def _on_data_changed(self, top_left: QModelIndex, bottom_right: QModelIndex, roles) -> None:
         if roles and all(role == Qt.SizeHintRole for role in roles):
-            self.list_view.doItemsLayout()
+            if not self._layout_recalc_timer.isActive():
+                self._layout_recalc_timer.start(16)
             return
         for row in range(top_left.row(), bottom_right.row() + 1):
             self._refresh_row_widget(row)
+        self._schedule_row_hydration(0)
+
+    def _refresh_indices_range(self, first_row: int, last_row: int) -> None:
+        first_row = max(0, int(first_row))
+        last_row = min(self.model.rowCount() - 1, int(last_row))
+        if last_row < first_row:
+            return
+        for row in range(first_row, last_row + 1):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            widget = self._widgets_by_key.get(msg.key)
+            if widget:
+                widget.set_message(msg, row + 1)
 
     def _refresh_indices_from(self, first_row: int = 0) -> None:
         for row in range(first_row, self.model.rowCount()):
@@ -1195,6 +1242,7 @@ class MessageListPane(QWidget):
             code_block_display_mode=self._code_block_display_mode,
         )
         widget.set_zoom_percent(self._native_zoom_percent)
+        self._pending_zoom_keys.discard(msg.key)
         widget.set_image_visibility(self._show_rich_entity_images, self._show_gallery_images)
         widget.relayoutRequested.connect(self._on_row_relayout_requested)
         self._widgets_by_key[msg.key] = widget
@@ -1266,7 +1314,9 @@ class MessageListPane(QWidget):
         viewport_w = max(360, self.list_view.viewport().width() - 12)
         padded = QSize(viewport_w, max(70, size_hint.height() + 8))
         self.model.update_size_hint(key, padded)
-        self.list_view.doItemsLayout()
+        # Batch expensive list relayouts (image-heavy rows can emit many resize events).
+        if not self._layout_recalc_timer.isActive():
+            self._layout_recalc_timer.start(24)
 
     def _apply_row_width(self, widget: MessageRowWidget) -> None:
         target_w = max(360, self.list_view.viewport().width() - 14)
@@ -1277,19 +1327,145 @@ class MessageListPane(QWidget):
         for widget in self._widgets_by_key.values():
             self._apply_row_width(widget)
 
+    def _visible_row_window(self, buffer_rows: int = 8) -> tuple[int, int]:
+        row_count = self.model.rowCount()
+        if row_count <= 0:
+            return (0, -1)
+        top_idx = self.list_view.indexAt(QPoint(8, 8))
+        bottom_idx = self.list_view.indexAt(QPoint(8, max(8, self.list_view.viewport().height() - 8)))
+        if top_idx.isValid():
+            start = top_idx.row()
+        else:
+            start = 0
+            for row in range(row_count):
+                rect = self.list_view.visualRect(self.model.index(row, 0))
+                if rect.isValid() and rect.bottom() >= 0:
+                    start = row
+                    break
+        if bottom_idx.isValid():
+            end = bottom_idx.row()
+        else:
+            end = min(row_count - 1, start + 12)
+            for row in range(start, row_count):
+                rect = self.list_view.visualRect(self.model.index(row, 0))
+                if rect.isValid() and rect.top() > self.list_view.viewport().height():
+                    end = max(start, row - 1)
+                    break
+        start = max(0, start - max(0, int(buffer_rows)))
+        end = min(row_count - 1, end + max(0, int(buffer_rows)))
+        return (start, end)
+
+    def viewport_hydration_progress(self) -> tuple[int, int]:
+        """Return hydration progress for currently visible rows (done, total)."""
+        start, end = self._visible_row_window(buffer_rows=0)
+        if end < start:
+            return (0, 0)
+        total = max(0, (end - start + 1))
+        done = 0
+        for row in range(start, end + 1):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            if msg.key in self._widgets_by_key:
+                done += 1
+        return (done, total)
+
+    def _apply_pending_zoom_near_viewport(self, force: bool = False) -> None:
+        if not self._pending_zoom_keys and not force:
+            return
+        start, end = self._visible_row_window(buffer_rows=10)
+        if end < start:
+            return
+        for row in range(start, end + 1):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            key = msg.key
+            if (not force) and key not in self._pending_zoom_keys:
+                continue
+            widget = self._widgets_by_key.get(key)
+            if widget is not None:
+                widget.set_zoom_percent(self._native_zoom_percent)
+                self._pending_zoom_keys.discard(key)
+
+    def _on_list_scrolled_for_zoom_update(self, _value: int) -> None:
+        self._last_scroll_ts = time.monotonic()
+        # Keep visible rows accurate while scrolling; background hydration remains throttled.
+        self._schedule_row_hydration(0)
+        if not self._pending_zoom_keys:
+            return
+        if self._zoom_apply_timer.isActive():
+            return
+        self._zoom_apply_timer.start(40)
+
+    def _schedule_row_hydration(self, delay_ms: int = 30) -> None:
+        if self._row_hydrate_timer.isActive():
+            return
+        self._row_hydrate_timer.start(max(0, int(delay_ms)))
+
+    def trigger_viewport_hydration(self) -> None:
+        """Force hydration passes for the current viewport after tab activation."""
+        self._last_scroll_ts = 0.0
+        self._schedule_row_hydration(0)
+        if not self._layout_recalc_timer.isActive():
+            self._layout_recalc_timer.start(0)
+        # Second pass catches rows that become visible after first relayout.
+        QTimer.singleShot(70, lambda: self._schedule_row_hydration(0))
+        QTimer.singleShot(140, lambda: self._schedule_row_hydration(0))
+
+    def _hydrate_rows_near_viewport(self) -> None:
+        # Phase 1: hydrate currently visible rows first (prevents clipping from stale size hints).
+        vis_start, vis_end = self._visible_row_window(buffer_rows=0)
+        if vis_end < vis_start:
+            return
+        active_scroll = (time.monotonic() - self._last_scroll_ts) < 0.20
+        visible_budget = 8 if active_scroll else 16
+        for row in range(vis_start, vis_end + 1):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            if msg.key in self._widgets_by_key:
+                continue
+            self._ensure_row_widget(row)
+            visible_budget -= 1
+            if visible_budget <= 0:
+                break
+
+        # Phase 2: progressively hydrate near-viewport rows.
+        start, end = self._visible_row_window(buffer_rows=10)
+        background_budget = 2 if active_scroll else 6
+        for row in range(start, end + 1):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            if vis_start <= row <= vis_end:
+                continue
+            if msg.key in self._widgets_by_key:
+                continue
+            self._ensure_row_widget(row)
+            background_budget -= 1
+            if background_budget <= 0:
+                break
+
+        # Continue progressively if viewport window is not fully hydrated yet.
+        for row in range(start, end + 1):
+            msg = self.model.message_at_row(row)
+            if not msg:
+                continue
+            if msg.key not in self._widgets_by_key:
+                self._row_hydrate_timer.start(60 if active_scroll else 24)
+                break
+
     def _set_native_zoom(self, zoom_percent: int) -> None:
         zoom_percent = max(50, min(250, int(zoom_percent or 100)))
         if zoom_percent == self._native_zoom_percent:
             return
         self._native_zoom_percent = zoom_percent
         self.header.setText(f"Native Mirror ({self._native_zoom_percent}%)")
-        for row in range(self.model.rowCount()):
-            msg = self.model.message_at_row(row)
-            if not msg:
-                continue
-            widget = self._widgets_by_key.get(msg.key)
-            if widget is not None:
-                widget.set_zoom_percent(self._native_zoom_percent)
+        self._pending_zoom_keys = set(self._widgets_by_key.keys())
+        self._apply_pending_zoom_near_viewport(force=True)
+        if self._pending_zoom_keys and not self._zoom_apply_timer.isActive():
+            self._zoom_apply_timer.start(60)
         self.list_view.doItemsLayout()
 
     def _change_native_zoom(self, delta: int) -> None:
@@ -1301,6 +1477,7 @@ class MessageListPane(QWidget):
                 self._apply_widths_to_all_rows()
                 # Width changes can change wrapping, so request a lazy relayout on visible rows.
                 QTimer.singleShot(0, self.list_view.doItemsLayout)
+                self._schedule_row_hydration(0)
             elif event.type() == QEvent.Wheel and hasattr(event, "modifiers"):
                 if event.modifiers() & Qt.ControlModifier:
                     delta = event.angleDelta().y() if hasattr(event, "angleDelta") else 0

@@ -32,6 +32,9 @@ class MirrorWebPage(QWebEnginePage):
     consoleEventReceived = Signal(str)
     CONSOLE_DELTA_PREFIX = "__CGM_DELTA__"
     CONSOLE_EVENT_PREFIX = "__CGM_EVT__"
+    _IGNORED_CONSOLE_SUBSTRINGS = (
+        "RecoverableError: Minified React error #418",
+    )
 
     def __init__(self, profile: QWebEngineProfile, parent: Optional[QObject] = None, new_page_factory=None) -> None:
         super().__init__(profile, parent)
@@ -54,4 +57,7 @@ class MirrorWebPage(QWebEnginePage):
         if isinstance(message, str) and message.startswith(self.CONSOLE_EVENT_PREFIX):
             self.consoleEventReceived.emit(message[len(self.CONSOLE_EVENT_PREFIX) :])
             return
+        if isinstance(message, str):
+            if any(token in message for token in self._IGNORED_CONSOLE_SUBSTRINGS):
+                return
         super().javaScriptConsoleMessage(level, message, line_number, source_id)

@@ -19,13 +19,43 @@ import hashlib
 import os
 import re
 import sys
+import argparse
 import tempfile
 import time
 import uuid
 from html import escape as html_escape
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+
+
+def _normalize_fontconfig_env() -> None:
+    """Ensure Linux Fontconfig env vars are valid before Qt initializes.
+
+    Some environments (especially after AppImage runs) can leak invalid values
+    like FONTCONFIG_FILE="(null)", which causes repeated runtime warnings.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    invalid_tokens = {"", "null", "(null)"}
+    fc_path = (os.environ.get("FONTCONFIG_PATH") or "").strip()
+    fc_file = (os.environ.get("FONTCONFIG_FILE") or "").strip()
+
+    if fc_file.lower() in invalid_tokens or (fc_file and not os.path.exists(fc_file)):
+        os.environ.pop("FONTCONFIG_FILE", None)
+
+    if fc_path.lower() in invalid_tokens or (fc_path and not os.path.exists(fc_path)):
+        etc_fonts = "/etc/fonts"
+        if os.path.isdir(etc_fonts):
+            os.environ["FONTCONFIG_PATH"] = etc_fonts
+
+    if "FONTCONFIG_FILE" not in os.environ:
+        default_fc_file = "/etc/fonts/fonts.conf"
+        if os.path.isfile(default_fc_file):
+            os.environ["FONTCONFIG_FILE"] = default_fc_file
+
+
+_normalize_fontconfig_env()
 
 from PySide6.QtCore import (
     QEvent,
@@ -69,6 +99,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QSplashScreen,
 )
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -117,6 +148,29 @@ APP_DISPLAY_NAME = "ChatGPT Mirror"
 APP_VERSION = os.environ.get("CHATGPT_MIRROR_VERSION", "dev")
 GITHUB_PROJECT_URL = "https://github.com/tekware-it/chatgpt_mirror"
 GITHUB_SPONSORS_URL = "https://github.com/sponsors/tekware-it"
+PERF_LOG_ENABLED = False
+
+
+def perf_log(msg: str) -> None:
+    """Emit lightweight perf logs when enabled via CLI/env."""
+    if not PERF_LOG_ENABLED:
+        return
+    try:
+        now = time.strftime("%H:%M:%S")
+        ms = int((time.time() % 1.0) * 1000)
+        print(f"[perf {now}.{ms:03d}] {msg}")
+    except Exception:
+        pass
+
+
+class DeferredTabPlaceholder(QWidget):
+    """Lightweight tab placeholder used to keep startup fast with many saved tabs."""
+    def __init__(self, tab_id: str, url: str, db_file: str, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.tab_id = (tab_id or "").strip()
+        self.url = (url or "").strip()
+        self.db_file = (db_file or "").strip()
+        self.title = (title or "").strip()
 
 class MainWindow(QMainWindow):
     """One application tab: native mirror (left) + ChatGPT WebView (right).
@@ -137,12 +191,27 @@ class MainWindow(QMainWindow):
         storage_db_file: Optional[str] = None,
         initial_snapshot: Optional[dict] = None,
         initial_url: Optional[str] = "https://chatgpt.com",
+        defer_web_load: bool = False,
+        restore_snapshot_on_create: bool = True,
     ) -> None:
         super().__init__()
         self._tabs_host = tabs_host
         self._offline_store = offline_store
         self.tab_id = (tab_id or uuid.uuid4().hex[:12]).strip()
         self.storage_db_file = (storage_db_file or "").strip() or None
+        self._defer_web_load = bool(defer_web_load)
+        self._pending_initial_url = initial_url or ""
+        self._snapshot_restored = False
+        self._restore_timer = QTimer(self)
+        self._restore_timer.setSingleShot(True)
+        self._restore_timer.timeout.connect(self._restore_snapshot_async_step)
+        self._restore_pending_messages: List[dict] = []
+        self._restore_total_messages = 0
+        self._restore_in_progress = False
+        self._restore_progress_cb: Optional[Callable[[int, int], None]] = None
+        self._restore_done_cb: Optional[Callable[[], None]] = None
+        self._restore_chunk_size = 80
+        self._restore_tick_delay_ms = 8
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
 
@@ -193,6 +262,15 @@ class MainWindow(QMainWindow):
         self._persist_timer = QTimer(self)
         self._persist_timer.setSingleShot(True)
         self._persist_timer.timeout.connect(self._persist_offline_snapshot_now)
+        # Live DOM deltas can arrive in large bursts after page hydration.
+        # Process them incrementally to keep the UI responsive.
+        self._dom_delta_queue_order: List[str] = []
+        self._dom_delta_queue_map: Dict[str, dict] = {}
+        self._dom_delta_timer = QTimer(self)
+        self._dom_delta_timer.setSingleShot(True)
+        self._dom_delta_timer.timeout.connect(self._process_dom_delta_chunk)
+        self._dom_delta_chunk_size = 12
+        self._dom_delta_autoscroll_pending = False
         self.left_pane.list_view.verticalScrollBar().valueChanged.connect(self._on_native_scroll_value_changed)
         self.left_pane.autoScrollChanged.connect(self._on_auto_scroll_changed)
         self.left_pane.webToNativeSyncChanged.connect(self._on_web_to_native_sync_changed)
@@ -214,14 +292,29 @@ class MainWindow(QMainWindow):
         splitter.setSizes([700, 900])
         self.setCentralWidget(splitter)
 
-        if initial_snapshot:
+        if initial_snapshot and restore_snapshot_on_create:
             self._restore_offline_snapshot(initial_snapshot)
+            self._snapshot_restored = True
+        elif not self.storage_db_file:
+            self._snapshot_restored = True
 
         self._apply_browser_language_setting()
         self.web_view.urlChanged.connect(lambda _u: self._schedule_persist_offline_snapshot())
         self.web_view.titleChanged.connect(lambda _t: self._schedule_persist_offline_snapshot())
-        if initial_url:
+        if (not self._defer_web_load) and initial_url:
             self.web_view.setUrl(QUrl(initial_url))
+
+    def ensure_activated(self) -> None:
+        """Lazily trigger only WebView load when this tab is first shown."""
+        try:
+            self.left_pane.trigger_viewport_hydration()
+        except Exception:
+            pass
+        if self._defer_web_load and self._pending_initial_url:
+            perf_log(f"ensure_activated tab={self.tab_id} load_url_start")
+            self._defer_web_load = False
+            self.web_view.setUrl(QUrl(self._pending_initial_url))
+            perf_log(f"ensure_activated tab={self.tab_id} load_url_done")
 
     def _show_about_dialog(self) -> None:
         """Show the application About dialog with version and project links."""
@@ -297,17 +390,88 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_delta_received(self, json_string: str) -> None:
         """Apply JS extractor deltas and schedule a debounced offline snapshot save."""
+        t0 = time.perf_counter()
         try:
+            t_parse0 = time.perf_counter()
             payload = json.loads(json_string)
+            parse_ms = int((time.perf_counter() - t_parse0) * 1000)
         except json.JSONDecodeError:
+            perf_log("dom_delta parse_error")
             return
         if not isinstance(payload, list):
+            perf_log("dom_delta ignored_non_list")
             return
-        self.model.apply_deltas(payload)
+        self._enqueue_dom_deltas(payload)
+        total_ms = int((time.perf_counter() - t0) * 1000)
+        perf_log(
+            f"dom_delta size={len(payload)} parse_ms={parse_ms} "
+            f"queued={len(self._dom_delta_queue_order)} total_ms={total_ms}"
+        )
+        if not self._dom_delta_timer.isActive():
+            self._dom_delta_timer.start(0)
+
+    def _enqueue_dom_deltas(self, payload: List[dict]) -> None:
+        """Coalesce live deltas by key and preserve first-seen order."""
+        if not isinstance(payload, list):
+            return
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            if not key:
+                continue
+            if key not in self._dom_delta_queue_map:
+                self._dom_delta_queue_order.append(key)
+            # Keep only the latest state for each key to avoid redundant work.
+            self._dom_delta_queue_map[key] = item
+        if payload:
+            self._dom_delta_autoscroll_pending = True
+
+    def _process_dom_delta_chunk(self) -> None:
+        if not self._dom_delta_queue_order:
+            if self._dom_delta_autoscroll_pending and self._auto_scroll_enabled and self.model.rowCount() > 0:
+                QTimer.singleShot(0, self._scroll_to_bottom)
+            self._dom_delta_autoscroll_pending = False
+            return
+
+        chunk_size = max(4, int(self._dom_delta_chunk_size))
+        take = min(chunk_size, len(self._dom_delta_queue_order))
+        keys = self._dom_delta_queue_order[:take]
+        self._dom_delta_queue_order = self._dom_delta_queue_order[take:]
+        chunk: List[dict] = []
+        for key in keys:
+            item = self._dom_delta_queue_map.pop(key, None)
+            if isinstance(item, dict):
+                chunk.append(item)
+
+        if not chunk:
+            if self._dom_delta_queue_order:
+                self._dom_delta_timer.start(1)
+            return
+
+        t_apply0 = time.perf_counter()
+        self.model.apply_deltas(chunk)
+        apply_ms = int((time.perf_counter() - t_apply0) * 1000)
+        perf_log(
+            f"dom_delta_apply chunk={len(chunk)} remain={len(self._dom_delta_queue_order)} "
+            f"apply_ms={apply_ms} chunk_size={self._dom_delta_chunk_size}"
+        )
+
+        # Adaptive chunk size: target short UI steps.
+        if apply_ms > 80 and self._dom_delta_chunk_size > 4:
+            self._dom_delta_chunk_size = max(4, self._dom_delta_chunk_size // 2)
+            perf_log(f"dom_delta_apply adapt chunk_down={self._dom_delta_chunk_size}")
+        elif apply_ms < 20 and self._dom_delta_chunk_size < 24:
+            self._dom_delta_chunk_size = min(24, self._dom_delta_chunk_size + 2)
+            perf_log(f"dom_delta_apply adapt chunk_up={self._dom_delta_chunk_size}")
+
         self._schedule_persist_offline_snapshot()
-        # Scroll to latest when new messages arrive; avoid jerky behavior by doing it async.
-        if self._auto_scroll_enabled and self.model.rowCount() > 0:
+        if self._dom_delta_queue_order:
+            self._dom_delta_timer.start(2)
+            return
+        if self._dom_delta_autoscroll_pending and self._auto_scroll_enabled and self.model.rowCount() > 0:
             QTimer.singleShot(0, self._scroll_to_bottom)
+        self._dom_delta_autoscroll_pending = False
 
     def _schedule_persist_offline_snapshot(self, delay_ms: int = 700) -> None:
         """Debounce SQLite snapshot writes to keep the UI responsive during streaming updates."""
@@ -382,6 +546,101 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def restore_offline_snapshot_async(
+        self,
+        snapshot: dict,
+        *,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        done_cb: Optional[Callable[[], None]] = None,
+        chunk_size: int = 80,
+    ) -> None:
+        """Restore a snapshot incrementally to keep UI responsive on long chats."""
+        if self._restore_in_progress:
+            perf_log(f"restore_async tab={self.tab_id} skipped_already_in_progress")
+            return
+        if not isinstance(snapshot, dict):
+            if done_cb:
+                done_cb()
+            return
+        payload = snapshot.get("messages")
+        if not isinstance(payload, list) or not payload:
+            self._snapshot_restored = True
+            if done_cb:
+                done_cb()
+            return
+        perf_log(f"restore_async tab={self.tab_id} start total_msgs={len(payload)} chunk={chunk_size}")
+        self._restore_pending_messages = payload
+        self._restore_total_messages = len(payload)
+        self._restore_progress_cb = progress_cb
+        self._restore_done_cb = done_cb
+        self._restore_chunk_size = max(8, int(chunk_size))
+        self._snapshot_restored = False
+        self._restore_in_progress = True
+        if self._restore_progress_cb:
+            try:
+                self._restore_progress_cb(0, self._restore_total_messages)
+            except Exception:
+                pass
+        self._restore_timer.start(0)
+
+    def _restore_snapshot_async_step(self) -> None:
+        t0 = time.perf_counter()
+        pending = self._restore_pending_messages
+        if not pending:
+            self._snapshot_restored = True
+            self._restore_total_messages = 0
+            self._restore_in_progress = False
+            cb = self._restore_done_cb
+            self._restore_done_cb = None
+            self._restore_progress_cb = None
+            try:
+                self.left_pane._refresh_indices_from(0)
+            except Exception:
+                pass
+            if cb:
+                cb()
+            perf_log(f"restore_async tab={self.tab_id} done total_ms={int((time.perf_counter()-t0)*1000)}")
+            return
+        current_chunk_size = max(8, int(self._restore_chunk_size))
+        chunk = pending[:current_chunk_size]
+        self._restore_pending_messages = pending[current_chunk_size:]
+        t_apply0 = time.perf_counter()
+        try:
+            self.model.apply_deltas(chunk)
+            for item in chunk:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key") or "").strip()
+                if not key or not item.get("collapsed"):
+                    continue
+                row = self.model.row_for_key(key)
+                msg = self.model.message_at_row(row) if row >= 0 else None
+                if msg:
+                    msg.collapsed = True
+        except Exception:
+            pass
+        apply_ms = int((time.perf_counter() - t_apply0) * 1000)
+        # Adaptive chunking: keep each UI-thread step short to avoid visible freezes.
+        if apply_ms > 120 and self._restore_chunk_size > 8:
+            self._restore_chunk_size = max(8, self._restore_chunk_size // 2)
+            perf_log(f"restore_async tab={self.tab_id} adapt chunk_down={self._restore_chunk_size} apply_ms={apply_ms}")
+        elif apply_ms < 35 and self._restore_chunk_size < 24:
+            self._restore_chunk_size = min(24, self._restore_chunk_size + 2)
+            perf_log(f"restore_async tab={self.tab_id} adapt chunk_up={self._restore_chunk_size} apply_ms={apply_ms}")
+        total = max(1, int(self._restore_total_messages or len(pending)))
+        done = max(0, total - len(self._restore_pending_messages))
+        perf_log(
+            f"restore_async tab={self.tab_id} step done={done}/{total} "
+            f"chunk={len(chunk)} apply_ms={apply_ms}"
+        )
+        if self._restore_progress_cb:
+            try:
+                self._restore_progress_cb(done, total)
+            except Exception:
+                pass
+        # Small delay yields the GUI thread between chunks (tab switching feels smoother).
+        self._restore_timer.start(max(1, int(self._restore_tick_delay_ms)))
+
     def offline_snapshot_url_guess(self) -> str:
         try:
             u = self.web_view.url().toString()
@@ -392,8 +651,7 @@ class MainWindow(QMainWindow):
         page_state = None
         if self._offline_store is not None:
             try:
-                snap = self._offline_store.load_tab_snapshot(self.tab_id, self.storage_db_file)
-                page_state = (snap or {}).get("page_state") if isinstance(snap, dict) else None
+                page_state = self._offline_store.load_tab_page_state(self.tab_id, self.storage_db_file)
             except Exception:
                 page_state = None
         if isinstance(page_state, dict):
@@ -1397,8 +1655,9 @@ class TabbedMainWindow(QMainWindow):
 
     It owns the shared WebEngine profile (single login session) and the tab manifest.
     """
-    def __init__(self) -> None:
+    def __init__(self, startup_progress_cb: Optional[Callable[[int, int, str], None]] = None) -> None:
         super().__init__()
+        self._startup_progress_cb = startup_progress_cb
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
         self._profile_root = ensure_profile_root()
@@ -1414,7 +1673,7 @@ class TabbedMainWindow(QMainWindow):
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
-        self.tabs.currentChanged.connect(lambda _i: self.schedule_manifest_save())
+        self.tabs.currentChanged.connect(self._on_current_tab_changed)
         self._tabs_plus_btn = QToolButton(self)
         self._tabs_plus_btn.setText("+")
         self._tabs_plus_btn.setPopupMode(QToolButton.InstantPopup)
@@ -1442,9 +1701,20 @@ class TabbedMainWindow(QMainWindow):
         self._snapshot_save_timer.setSingleShot(True)
         self._snapshot_save_timer.timeout.connect(self._persist_all_tabs_now)
 
+        self._emit_startup_progress(1, 5, "Initializing profile...")
         self._restore_tabs_from_disk()
         if self.tabs.count() == 0:
             self.create_mirror_tab(url="https://chatgpt.com", switch=True)
+        self._emit_startup_progress(5, 5, "Ready")
+
+    def _emit_startup_progress(self, current: int, total: int, message: str) -> None:
+        cb = self._startup_progress_cb
+        if cb is None:
+            return
+        try:
+            cb(int(current), int(total), str(message or ""))
+        except Exception:
+            pass
 
     def create_mirror_tab(
         self,
@@ -1453,6 +1723,9 @@ class TabbedMainWindow(QMainWindow):
         tab_id: Optional[str] = None,
         storage_db_file: Optional[str] = None,
         initial_snapshot: Optional[dict] = None,
+        defer_web_load: bool = False,
+        restore_snapshot_on_create: bool = True,
+        title_hint: Optional[str] = None,
     ) -> Optional[MainWindow]:
         """Create a new in-app tab, optionally restoring an offline snapshot."""
         pane = MainWindow(
@@ -1464,6 +1737,8 @@ class TabbedMainWindow(QMainWindow):
             storage_db_file=storage_db_file,
             initial_snapshot=initial_snapshot,
             initial_url=url,
+            defer_web_load=defer_web_load,
+            restore_snapshot_on_create=restore_snapshot_on_create,
         )
         idx = self.tabs.addTab(pane, "Nuovo tab")
         saved_tab_title = ""
@@ -1471,6 +1746,8 @@ class TabbedMainWindow(QMainWindow):
             page_state = initial_snapshot.get("page_state")
             if isinstance(page_state, dict):
                 saved_tab_title = str(page_state.get("tab_title") or "").strip()
+        if not saved_tab_title:
+            saved_tab_title = (title_hint or "").strip()
         if saved_tab_title:
             shown = saved_tab_title if len(saved_tab_title) <= 28 else (saved_tab_title[:27].rstrip() + "…")
             self.tabs.setTabText(idx, shown)
@@ -1485,8 +1762,98 @@ class TabbedMainWindow(QMainWindow):
             self._update_tab_title_for_pane(pane, pane.web_view.title())
         if switch:
             self.tabs.setCurrentIndex(idx)
+            pane.ensure_activated()
         self.schedule_manifest_save()
         return pane
+
+    def _on_current_tab_changed(self, _index: int) -> None:
+        t0 = time.perf_counter()
+        perf_log(f"tab_changed idx={self.tabs.currentIndex()} count={self.tabs.count()} start")
+        pane = self._materialize_current_tab_if_deferred()
+        if isinstance(pane, MainWindow):
+            if not pane._snapshot_restored:
+                self._restore_current_tab_with_progress()
+            else:
+                pane.ensure_activated()
+        self.schedule_manifest_save()
+        perf_log(f"tab_changed idx={self.tabs.currentIndex()} end elapsed_ms={int((time.perf_counter()-t0)*1000)}")
+
+    def _tab_title_from_manifest_item(self, item: dict) -> str:
+        title_hint = str(item.get("title") or "").strip()
+        if not title_hint:
+            db_file = str(item.get("db_file") or "").strip()
+            if db_file:
+                title_hint = Path(db_file).stem
+        return title_hint or "ChatGPT"
+
+    def _add_deferred_tab_from_manifest_item(self, item: dict, switch: bool = False) -> Optional[DeferredTabPlaceholder]:
+        if not isinstance(item, dict):
+            return None
+        tab_id = str(item.get("tab_id") or "").strip()
+        if not tab_id:
+            return None
+        db_file = str(item.get("db_file") or "").strip()
+        url = str(item.get("url") or "https://chatgpt.com").strip() or "https://chatgpt.com"
+        title_hint = self._tab_title_from_manifest_item(item)
+        placeholder = DeferredTabPlaceholder(tab_id=tab_id, url=url, db_file=db_file, title=title_hint)
+        shown = title_hint if len(title_hint) <= 28 else (title_hint[:27].rstrip() + "…")
+        idx = self.tabs.addTab(placeholder, shown)
+        self.tabs.setTabToolTip(idx, title_hint)
+        if switch:
+            self.tabs.setCurrentIndex(idx)
+        return placeholder
+
+    def _materialize_deferred_tab(self, index: int) -> Optional[MainWindow]:
+        t0 = time.perf_counter()
+        if index < 0 or index >= self.tabs.count():
+            return None
+        widget = self.tabs.widget(index)
+        if isinstance(widget, MainWindow):
+            return widget
+        if not isinstance(widget, DeferredTabPlaceholder):
+            return None
+
+        pane = MainWindow(
+            tabs_host=self,
+            shared_profile=self.web_profile,
+            profile_root=self._profile_root,
+            offline_store=self._offline_store,
+            tab_id=widget.tab_id,
+            storage_db_file=widget.db_file or None,
+            initial_snapshot=None,
+            initial_url=widget.url or "https://chatgpt.com",
+            defer_web_load=True,
+            restore_snapshot_on_create=False,
+        )
+        shown = (widget.title or "ChatGPT")
+        shown = shown if len(shown) <= 28 else (shown[:27].rstrip() + "…")
+        tooltip = widget.title or shown
+
+        was_current = self.tabs.currentIndex() == index
+        self.tabs.removeTab(index)
+        self.tabs.insertTab(index, pane, shown)
+        self.tabs.setTabToolTip(index, tooltip)
+        # Preserve the selected tab while replacing placeholder -> real pane.
+        # Without this, Qt may temporarily move selection to index 0.
+        if was_current:
+            self.tabs.setCurrentIndex(index)
+        try:
+            pane.web_view.titleChanged.connect(lambda title, p=pane: self._update_tab_title_for_pane(p, title))
+            pane.web_view.urlChanged.connect(lambda _u, p=pane: self._update_tab_title_for_pane(p, pane.web_view.title()))
+            pane.web_view.urlChanged.connect(lambda _u: self.schedule_manifest_save())
+        except Exception:
+            pass
+        perf_log(
+            f"materialize_tab idx={index} tab_id={widget.tab_id} "
+            f"db={widget.db_file or '-'} elapsed_ms={int((time.perf_counter()-t0)*1000)}"
+        )
+        return pane
+
+    def _materialize_current_tab_if_deferred(self) -> Optional[MainWindow]:
+        idx = self.tabs.currentIndex()
+        if idx < 0:
+            return None
+        return self._materialize_deferred_tab(idx)
 
     def _pane_tab_index(self, pane: MainWindow) -> int:
         for i in range(self.tabs.count()):
@@ -1516,20 +1883,26 @@ class TabbedMainWindow(QMainWindow):
             if isinstance(pane, MainWindow) and (pane.storage_db_file or "") == db_file_name:
                 self.tabs.setCurrentIndex(i)
                 return True
+            if isinstance(pane, DeferredTabPlaceholder) and (pane.db_file or "") == db_file_name:
+                self.tabs.setCurrentIndex(i)
+                return True
+        # Do not load the whole snapshot synchronously here: for large files it can freeze.
+        # Load only page metadata and let normal async restore path show per-tab progress.
         try:
-            snapshot = self._offline_store.load_tab_snapshot(uuid.uuid4().hex[:8], db_file_name)
+            page_state = self._offline_store.load_tab_page_state(uuid.uuid4().hex[:8], db_file_name)
         except Exception:
-            snapshot = None
-        if not isinstance(snapshot, dict):
+            page_state = None
+        if not isinstance(page_state, dict):
             return False
-        page_state = snapshot.get("page_state") if isinstance(snapshot.get("page_state"), dict) else {}
-        url = str((page_state or {}).get("url") or "https://chatgpt.com")
+        url = str(page_state.get("url") or "https://chatgpt.com")
         pane = self.create_mirror_tab(
             url=url,
             switch=True,
             tab_id=uuid.uuid4().hex[:12],
             storage_db_file=db_file_name,
-            initial_snapshot=snapshot,
+            initial_snapshot=None,
+            restore_snapshot_on_create=False,
+            title_hint=str(page_state.get("tab_title") or page_state.get("title") or "").strip(),
         )
         return pane is not None
 
@@ -1610,19 +1983,28 @@ class TabbedMainWindow(QMainWindow):
         tabs_payload = []
         for i in range(self.tabs.count()):
             pane = self.tabs.widget(i)
-            if not isinstance(pane, MainWindow):
-                continue
-            try:
-                url = pane.web_view.url().toString() or pane.offline_snapshot_url_guess()
-            except Exception:
-                url = ""
-            tabs_payload.append(
-                {
-                    "tab_id": pane.tab_id,
-                    "url": url,
-                    "db_file": pane.storage_db_file or "",
-                }
-            )
+            if isinstance(pane, MainWindow):
+                try:
+                    url = pane.web_view.url().toString() or pane.offline_snapshot_url_guess()
+                except Exception:
+                    url = ""
+                tabs_payload.append(
+                    {
+                        "tab_id": pane.tab_id,
+                        "url": url,
+                        "db_file": pane.storage_db_file or "",
+                        "title": (self.tabs.tabText(i) or ""),
+                    }
+                )
+            elif isinstance(pane, DeferredTabPlaceholder):
+                tabs_payload.append(
+                    {
+                        "tab_id": pane.tab_id,
+                        "url": pane.url,
+                        "db_file": pane.db_file,
+                        "title": pane.title or (self.tabs.tabText(i) or ""),
+                    }
+                )
         try:
             self._offline_store.save_manifest(
                 {"current_index": max(0, self.tabs.currentIndex()), "tabs": tabs_payload}
@@ -1647,39 +2029,93 @@ class TabbedMainWindow(QMainWindow):
         except Exception:
             manifest = {"tabs": [], "current_index": 0}
         tabs = manifest.get("tabs") or []
+        try:
+            current_idx = int(manifest.get("current_index") or 0)
+        except Exception:
+            current_idx = 0
+        if tabs:
+            current_idx = max(0, min(current_idx, len(tabs) - 1))
         restored = 0
         for item in tabs:
-            if not isinstance(item, dict):
-                continue
-            tab_id = str(item.get("tab_id") or "").strip()
-            if not tab_id:
-                continue
-            db_file = str(item.get("db_file") or "").strip() or None
-            snapshot = None
-            try:
-                snapshot = self._offline_store.load_tab_snapshot(tab_id, db_file)
-            except Exception:
-                snapshot = None
-            page_state = (snapshot or {}).get("page_state") if isinstance(snapshot, dict) else {}
-            url = str((page_state or {}).get("url") or item.get("url") or "https://chatgpt.com")
-            if not url:
-                url = "https://chatgpt.com"
-            pane = self.create_mirror_tab(
-                url=url,
-                switch=False,
-                tab_id=tab_id,
-                storage_db_file=db_file,
-                initial_snapshot=snapshot,
-            )
-            if pane is not None:
+            placeholder = self._add_deferred_tab_from_manifest_item(item, switch=False)
+            if placeholder is not None:
                 restored += 1
         if restored:
-            try:
-                idx = int(manifest.get("current_index") or 0)
-            except Exception:
-                idx = 0
-            idx = max(0, min(idx, self.tabs.count() - 1))
+            idx = max(0, min(current_idx, self.tabs.count() - 1))
             self.tabs.setCurrentIndex(idx)
+            QTimer.singleShot(0, lambda: self._on_current_tab_changed(self.tabs.currentIndex()))
+
+    def _restore_current_tab_with_progress(self) -> None:
+        pane = self._materialize_current_tab_if_deferred()
+        if not isinstance(pane, MainWindow):
+            return
+        if pane._snapshot_restored or pane._restore_in_progress:
+            pane.ensure_activated()
+            return
+        if not pane.storage_db_file:
+            pane.ensure_activated()
+            return
+        try:
+            t_load0 = time.perf_counter()
+            snapshot = self._offline_store.load_tab_snapshot(
+                pane.tab_id,
+                pane.storage_db_file,
+                preload_images=True,
+                preload_image_limit=24,
+            )
+            perf_log(
+                f"load_snapshot tab={pane.tab_id} db={pane.storage_db_file or '-'} "
+                f"elapsed_ms={int((time.perf_counter()-t_load0)*1000)} "
+                f"msgs={(len(snapshot.get('messages', [])) if isinstance(snapshot, dict) else 0)}"
+            )
+        except Exception:
+            snapshot = None
+            perf_log(f"load_snapshot tab={pane.tab_id} failed")
+        if not isinstance(snapshot, dict):
+            pane.ensure_activated()
+            return
+
+        idx = self._pane_tab_index(pane)
+        base_text = self.tabs.tabText(idx) if idx >= 0 else "Tab"
+        if not base_text:
+            base_text = "Tab"
+        base_text = re.sub(r"\s+\(\d{1,3}%\)$", "", base_text).strip() or "Tab"
+        self.statusBar().showMessage("Hydrating selected tab viewport... 0%")
+
+        def _progress(done: int, total: int) -> None:
+            # Show what the user perceives: hydrated visible rows, not raw DB/model load.
+            h_done, h_total = pane.left_pane.viewport_hydration_progress()
+            pct = int(round((max(0, h_done) / max(1, h_total)) * 100)) if h_total > 0 else 0
+            if idx >= 0:
+                self.tabs.setTabText(idx, f"{base_text} ({pct}%)")
+            self.statusBar().showMessage(
+                f"Hydrating selected tab viewport... {pct}% (rows {h_done}/{max(1, h_total)})"
+            )
+
+        def _done() -> None:
+            h_done, h_total = pane.left_pane.viewport_hydration_progress()
+            pct = int(round((max(0, h_done) / max(1, h_total)) * 100)) if h_total > 0 else 100
+            if idx >= 0:
+                self.tabs.setTabText(idx, f"{base_text} ({pct}%)")
+            self.statusBar().showMessage(
+                f"Hydrating selected tab viewport... {pct}% (rows {h_done}/{max(1, h_total)})"
+            )
+            try:
+                pane.left_pane.trigger_viewport_hydration()
+            except Exception:
+                pass
+            # Final pass once viewport hydration has settled.
+            def _finish_ui() -> None:
+                h_done2, h_total2 = pane.left_pane.viewport_hydration_progress()
+                pct2 = int(round((max(0, h_done2) / max(1, h_total2)) * 100)) if h_total2 > 0 else 100
+                if idx >= 0:
+                    self.tabs.setTabText(idx, base_text if pct2 >= 100 else f"{base_text} ({pct2}%)")
+                if pct2 >= 100:
+                    self.statusBar().clearMessage()
+            QTimer.singleShot(220, _finish_ui)
+            pane.ensure_activated()
+
+        pane.restore_offline_snapshot_async(snapshot, progress_cb=_progress, done_cb=_done, chunk_size=12)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         try:
@@ -1692,7 +2128,18 @@ class TabbedMainWindow(QMainWindow):
 
 def main() -> int:
     """Application entry point."""
-    app = QApplication(sys.argv)
+    global PERF_LOG_ENABLED
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--perf-log",
+        action="store_true",
+        help="Enable performance logs for tab switch/restore debugging.",
+    )
+    args, qt_args = parser.parse_known_args(sys.argv[1:])
+    PERF_LOG_ENABLED = bool(args.perf_log or os.environ.get("CGM_PERF_LOG", "").strip() == "1")
+
+    app = QApplication([sys.argv[0], *qt_args])
+    perf_log("app_start")
     app.setApplicationName("chatgpt_mirror")
     app.setStyleSheet(
         """
@@ -1707,8 +2154,10 @@ def main() -> int:
         QPushButton:pressed { background: #e2e8f0; }
         """
     )
+
     window = TabbedMainWindow()
     window.show()
+    perf_log("main_window_shown")
     return app.exec()
 
 
