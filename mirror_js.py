@@ -890,6 +890,7 @@ JS_INJECTOR = r"""
     state.restorePinnedUntilByKey = new Map();
     state.restorePinMs = 15000;
     state.scrollSyncDebug = false;
+    state.uiReadySent = false;
     state.pending = false;
     state.lastScanAt = 0;
     state.lastTopKeySent = '';
@@ -942,6 +943,34 @@ JS_INJECTOR = r"""
       sendEvent({ type: 'scroll_top_key', key: key, progress: progress, reason: reason || 'web_scroll' });
     }
 
+    function isUiReady() {
+      var selectors = [
+        'textarea',
+        '[contenteditable="true"][data-testid*="composer"]',
+        '[data-testid*="composer"] textarea',
+        'form textarea',
+        '#prompt-textarea'
+      ];
+      for (var i = 0; i < selectors.length; i++) {
+        try {
+          var n = document.querySelector(selectors[i]);
+          if (n && isVisibleish(n)) return true;
+        } catch (e) {}
+      }
+      return false;
+    }
+
+    function emitUiReadyIfNeeded(reason) {
+      if (state.uiReadySent) return;
+      if (!isUiReady()) return;
+      state.uiReadySent = true;
+      sendEvent({
+        type: 'ui_ready',
+        reason: reason || 'scan',
+        title: (document && document.title) ? String(document.title) : ''
+      });
+    }
+
     function scanNow(reason) {
       state.pending = false;
       state.lastScanAt = Date.now();
@@ -966,6 +995,7 @@ JS_INJECTOR = r"""
       sendDeltas(deltas);
       pruneDom(nodes, state.keepDom, state);
       emitTopKeyIfChanged('scan');
+      emitUiReadyIfNeeded(reason);
       return 'scan:' + reason + ':nodes=' + nodes.length + ':deltas=' + deltas.length;
     }
 
@@ -1098,4 +1128,3 @@ JS_INJECTOR = r"""
   return "chatgpt_mirror_bootstrap_requested";
 })();
 """
-

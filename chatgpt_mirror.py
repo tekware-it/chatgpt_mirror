@@ -212,6 +212,9 @@ class MainWindow(QMainWindow):
         self._restore_done_cb: Optional[Callable[[], None]] = None
         self._restore_chunk_size = 80
         self._restore_tick_delay_ms = 8
+        # Tab title updates stay locked until page load succeeds.
+        self._tab_title_locked = True
+        self._tab_title_lock_seq = 0
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
 
@@ -666,6 +669,14 @@ class MainWindow(QMainWindow):
         except json.JSONDecodeError:
             return
         if not isinstance(evt, dict):
+            return
+        if evt.get("type") == "ui_ready":
+            host = self._tabs_host
+            if host is not None and hasattr(host, "_on_pane_ui_ready"):
+                try:
+                    host._on_pane_ui_ready(self, evt)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
             return
         if evt.get("type") == "scroll_debug":
             if self._scroll_sync_debug_enabled:
@@ -1753,9 +1764,11 @@ class TabbedMainWindow(QMainWindow):
             self.tabs.setTabText(idx, shown)
             self.tabs.setTabToolTip(idx, saved_tab_title)
         try:
-            pane.web_view.titleChanged.connect(lambda title, p=pane: self._update_tab_title_for_pane(p, title))
+            pane.web_view.titleChanged.connect(lambda title, p=pane: self._on_pane_title_changed(p, title))
             pane.web_view.urlChanged.connect(lambda _u, p=pane: self._update_tab_title_for_pane(p, pane.web_view.title()))
             pane.web_view.urlChanged.connect(lambda _u: self.schedule_manifest_save())
+            pane.web_view.loadStarted.connect(lambda p=pane: self._on_pane_load_started(p))
+            pane.web_view.loadFinished.connect(lambda ok, p=pane: self._on_pane_load_finished(p, bool(ok)))
         except Exception:
             pass
         if not saved_tab_title:
@@ -1838,9 +1851,11 @@ class TabbedMainWindow(QMainWindow):
         if was_current:
             self.tabs.setCurrentIndex(index)
         try:
-            pane.web_view.titleChanged.connect(lambda title, p=pane: self._update_tab_title_for_pane(p, title))
+            pane.web_view.titleChanged.connect(lambda title, p=pane: self._on_pane_title_changed(p, title))
             pane.web_view.urlChanged.connect(lambda _u, p=pane: self._update_tab_title_for_pane(p, pane.web_view.title()))
             pane.web_view.urlChanged.connect(lambda _u: self.schedule_manifest_save())
+            pane.web_view.loadStarted.connect(lambda p=pane: self._on_pane_load_started(p))
+            pane.web_view.loadFinished.connect(lambda ok, p=pane: self._on_pane_load_finished(p, bool(ok)))
         except Exception:
             pass
         perf_log(
@@ -1864,6 +1879,50 @@ class TabbedMainWindow(QMainWindow):
     def _is_generic_chatgpt_title(self, title: str) -> bool:
         t = (title or "").strip().lower()
         return t.startswith("chatgpt.com")
+
+    def _is_meaningful_page_title(self, title: str) -> bool:
+        t = (title or "").strip()
+        if not t:
+            return False
+        if self._is_generic_chatgpt_title(t):
+            return False
+        if t.lower() in {"chatgpt", "nuovo tab", "new tab"}:
+            return False
+        return True
+
+    def _on_pane_load_started(self, pane: MainWindow) -> None:
+        pane._tab_title_lock_seq = int(getattr(pane, "_tab_title_lock_seq", 0)) + 1
+        pane._tab_title_locked = True
+
+    def _on_pane_title_changed(self, pane: MainWindow, title: str) -> None:
+        if getattr(pane, "_tab_title_locked", False):
+            if self._is_meaningful_page_title(title):
+                pane._tab_title_locked = False
+                self._update_tab_title_for_pane(pane, title)
+                self.schedule_manifest_save()
+            return
+        self._update_tab_title_for_pane(pane, title)
+
+    def _on_pane_load_finished(self, pane: MainWindow, ok: bool) -> None:
+        # Title lock is intentionally NOT released on loadFinished.
+        # For ChatGPT SPA pages, loadFinished can happen before redirects/hydration settle.
+        # We unlock only when JS emits `ui_ready` (composer detected).
+        return
+
+    def _on_pane_ui_ready(self, pane: MainWindow, evt: dict) -> None:
+        """Unlock tab title when JS confirms chat UI/composer is actually ready."""
+        if not isinstance(evt, dict):
+            return
+        title = str(evt.get("title") or pane.web_view.title() or "").strip()
+        pane._tab_title_locked = False
+        # If title is still generic, keep current tab text; otherwise apply it now.
+        if self._is_meaningful_page_title(title):
+            self._update_tab_title_for_pane(pane, title)
+        self.schedule_manifest_save()
+        perf_log(
+            f"ui_ready tab={pane.tab_id} "
+            f"title={'yes' if self._is_meaningful_page_title(title) else 'generic'}"
+        )
 
     def tab_display_title_for_pane(self, pane: MainWindow) -> str:
         idx = self._pane_tab_index(pane)
@@ -1933,6 +1992,8 @@ class TabbedMainWindow(QMainWindow):
             QMessageBox.warning(self, "Apri snapshot", "Impossibile aprire lo snapshot selezionato.")
 
     def _update_tab_title_for_pane(self, pane: MainWindow, title: str) -> None:
+        if getattr(pane, "_tab_title_locked", False):
+            return
         idx = self._pane_tab_index(pane)
         if idx < 0:
             return
