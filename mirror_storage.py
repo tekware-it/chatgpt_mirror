@@ -99,6 +99,44 @@ class OfflineStore:
             name += ".sqlite"
         return re.sub(r"[^a-zA-Z0-9._ -]+", "_", name)
 
+    def _extract_title_stem_from_db_file(self, db_file: str) -> str:
+        """Return canonical title stem from '<title>__<timestamp>[__suffix].sqlite'."""
+        stem = Path((db_file or "").strip()).stem
+        if not stem:
+            return ""
+        # Drop optional collision suffix first: __abcdef
+        m = re.match(r"^(.*)__([0-9a-f]{6})$", stem, flags=re.IGNORECASE)
+        if m:
+            stem = (m.group(1) or "").strip()
+        # Drop timestamp part: __YYYYMMDD-HHMMSS
+        m = re.match(r"^(.*)__([0-9]{8}-[0-9]{6})$", stem)
+        if m:
+            stem = (m.group(1) or "").strip()
+        return self._safe_db_stem(stem)
+
+    def _find_latest_db_name_by_stem(self, stem: str) -> Optional[str]:
+        """Find the most recently modified snapshot filename for a given title stem."""
+        stem = self._safe_db_stem(stem or "")
+        if not stem:
+            return None
+        matches = []
+        for path in self.tabs_dir.glob("*.sqlite"):
+            try:
+                cur_stem = self._extract_title_stem_from_db_file(path.name)
+            except Exception:
+                cur_stem = ""
+            if cur_stem != stem:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            matches.append((mtime, path.name))
+        if not matches:
+            return None
+        matches.sort(key=lambda it: it[0], reverse=True)
+        return matches[0][1]
+
     def db_path_for_tab(self, tab_id: str, db_file: Optional[str] = None) -> Path:
         if db_file:
             return self.tabs_dir / self._normalize_db_file_name(db_file)
@@ -214,16 +252,37 @@ class OfflineStore:
         - cached image bytes used by the native image renderer
         """
         now = time.time()
-        desired_name = self.suggest_db_file_name(title=title, url=url, saved_at=now)
-        current_path = self.db_path_for_tab(tab_id, db_file)
-        desired_path = self.db_path_for_tab(tab_id, desired_name)
-        try:
-            if current_path.exists() and current_path.name != desired_path.name:
-                self._rename_db_files(current_path, desired_path)
-        except Exception:
-            pass
-        final_path = desired_path if desired_path.exists() or current_path.name != desired_path.name else current_path
-        conn = self._connect(tab_id, final_path.name)
+        # Use only persisted tab title for naming. Avoid URL/title fallbacks that can
+        # generate noisy UUID-like filenames for transient ChatGPT routes.
+        current_name = self._normalize_db_file_name(db_file or "") if db_file else ""
+        current_stem = self._extract_title_stem_from_db_file(current_name) if current_name else ""
+        naming_title = (tab_title or "").strip()
+        if naming_title.lower() in {"chatgpt", "chatgpt.com", "chat"}:
+            naming_title = ""
+        if not naming_title:
+            # Keep existing stem when title is missing/generic, avoid noisy renames.
+            naming_title = current_stem or "chat"
+
+        desired_stem = self._safe_db_stem(naming_title)
+        desired_name = self.suggest_db_file_name(title=desired_stem, url="", saved_at=now)
+
+        # Reuse the existing DB for the same title stem (current tab file first,
+        # otherwise any latest file found on disk). Create a new DB only for new stems.
+        target_name = ""
+        if current_name and current_stem and current_stem == desired_stem:
+            target_name = current_name
+        if not target_name:
+            existing_same_stem = self._find_latest_db_name_by_stem(desired_stem)
+            if existing_same_stem:
+                target_name = existing_same_stem
+        if not target_name:
+            target_name = desired_name
+            target_path = self.db_path_for_tab(tab_id, target_name)
+            if target_path.exists():
+                suffix = hashlib.sha1(str(time.time()).encode("utf-8")).hexdigest()[:6]
+                target_name = f"{target_path.stem}__{suffix}{target_path.suffix}"
+
+        conn = self._connect(tab_id, target_name)
         try:
             with conn:
                 conn.execute("DELETE FROM page_state")
@@ -291,7 +350,7 @@ class OfflineStore:
                     )
         finally:
             conn.close()
-        return final_path.name
+        return target_name
 
     def load_tab_page_state(self, tab_id: str, db_file: Optional[str] = None) -> Optional[dict]:
         """Load only page metadata for one tab snapshot (no messages, no image blobs)."""

@@ -513,8 +513,17 @@ class MainWindow(QMainWindow):
                 tab_title = str(host.tab_display_title_for_pane(self) or "")  # type: ignore[attr-defined]
             except Exception:
                 tab_title = ""
+        # Avoid creating snapshot files for empty/generic tabs (fresh "new tab").
+        title_norm = (title or "").strip().lower()
+        tab_title_norm = (tab_title or "").strip().lower()
+        is_generic_title = (
+            (not tab_title_norm or tab_title_norm in {"chat", "chatgpt", "chatgpt.com", "new tab", "nuovo tab"})
+            and (not title_norm or title_norm in {"chatgpt", "chatgpt.com", "new tab", "nuovo tab"})
+        )
         try:
             messages = self.model.messages_in_order()
+            if is_generic_title and not messages:
+                return
             self.storage_db_file = self._offline_store.save_tab_snapshot(
                 self.tab_id,
                 url=url,
@@ -1876,6 +1885,21 @@ class TabbedMainWindow(QMainWindow):
                 return i
         return -1
 
+    def _sanitize_tab_title_for_storage(self, title: str) -> str:
+        t = (title or "").strip()
+        if not t:
+            return ""
+        # Remove transient progress suffix from restore/hydration UI.
+        t = re.sub(r"\s+\(\d{1,3}%\)$", "", t).strip()
+        # Remove visual truncation marker used in tab text.
+        t = t.rstrip("…").strip()
+        low = t.lower()
+        if low in {"chatgpt", "chatgpt.com", "new tab", "nuovo tab"}:
+            return ""
+        if low.startswith("chatgpt.com"):
+            return ""
+        return t
+
     def _is_generic_chatgpt_title(self, title: str) -> bool:
         t = (title or "").strip().lower()
         return t.startswith("chatgpt.com")
@@ -1929,7 +1953,12 @@ class TabbedMainWindow(QMainWindow):
         if idx < 0:
             return ""
         try:
-            return self.tabs.tabText(idx) or ""
+            # Prefer tooltip (usually full title), fallback to visible tab text.
+            tooltip = self.tabs.tabToolTip(idx) or ""
+            cleaned = self._sanitize_tab_title_for_storage(tooltip)
+            if cleaned:
+                return cleaned
+            return self._sanitize_tab_title_for_storage(self.tabs.tabText(idx) or "")
         except Exception:
             return ""
 
@@ -2054,7 +2083,7 @@ class TabbedMainWindow(QMainWindow):
                         "tab_id": pane.tab_id,
                         "url": url,
                         "db_file": pane.storage_db_file or "",
-                        "title": (self.tabs.tabText(i) or ""),
+                        "title": self._sanitize_tab_title_for_storage(self.tabs.tabToolTip(i) or self.tabs.tabText(i) or ""),
                     }
                 )
             elif isinstance(pane, DeferredTabPlaceholder):
@@ -2063,7 +2092,9 @@ class TabbedMainWindow(QMainWindow):
                         "tab_id": pane.tab_id,
                         "url": pane.url,
                         "db_file": pane.db_file,
-                        "title": pane.title or (self.tabs.tabText(i) or ""),
+                        "title": self._sanitize_tab_title_for_storage(
+                            pane.title or self.tabs.tabToolTip(i) or self.tabs.tabText(i) or ""
+                        ),
                     }
                 )
         try:
