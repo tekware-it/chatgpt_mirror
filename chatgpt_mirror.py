@@ -231,6 +231,7 @@ class MainWindow(QMainWindow):
         # Tab title updates stay locked until page load succeeds.
         self._tab_title_locked = True
         self._tab_title_lock_seq = 0
+        self._web_shutdown_done = False
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1600, 900)
 
@@ -349,7 +350,8 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("About")
         dlg.setModal(True)
-        dlg.resize(520, 260)
+        dlg.resize(520, 320)
+        dlg.setMinimumSize(520, 320)
 
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -358,6 +360,9 @@ class MainWindow(QMainWindow):
         title = QLabel(f"<b>{APP_DISPLAY_NAME}</b>")
         title.setStyleSheet("QLabel { font-size: 16px; }")
         layout.addWidget(title)
+        version_line = QLabel(f"Version {APP_VERSION}")
+        version_line.setStyleSheet("QLabel { color: #111827; font-weight: 600; }")
+        layout.addWidget(version_line)
 
         subtitle = QLabel(
             "Native ChatGPT DOM mirror with offline snapshots and export tools. "
@@ -389,6 +394,48 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
 
         dlg.exec()
+
+    def shutdown_web_resources(self) -> None:
+        """Detach and destroy WebEngine objects before profile teardown.
+
+        QtWebEngine warns if a profile is released while pages still exist.
+        We explicitly replace the page first, then delete the old one.
+        """
+        if self._web_shutdown_done:
+            return
+        self._web_shutdown_done = True
+        try:
+            self._js_mem_log_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._native_scroll_sync_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._dom_delta_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.web_view.stop()
+        except Exception:
+            pass
+        old_page = None
+        try:
+            old_page = self.web_view.page()
+        except Exception:
+            old_page = None
+        if old_page is None:
+            return
+        try:
+            replacement = QWebEnginePage(QWebEngineProfile.defaultProfile(), self.web_view)
+            self.web_view.setPage(replacement)
+        except Exception:
+            replacement = None
+        try:
+            old_page.deleteLater()
+        except Exception:
+            pass
 
     def _create_new_tab_page(self):
         host = self._tabs_host
@@ -2403,6 +2450,10 @@ class TabbedMainWindow(QMainWindow):
                 w._persist_offline_snapshot_now()
             except Exception:
                 pass
+            try:
+                w.shutdown_web_resources()
+            except Exception:
+                pass
         self.tabs.removeTab(index)
         if w is not None:
             w.deleteLater()
@@ -2568,6 +2619,16 @@ class TabbedMainWindow(QMainWindow):
         try:
             self._persist_all_tabs_now()
             self._save_manifest_now()
+        except Exception:
+            pass
+        # Ensure WebEngine pages are destroyed before shared profile teardown.
+        try:
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, MainWindow):
+                    w.shutdown_web_resources()
+            for _ in range(4):
+                QApplication.processEvents()
         except Exception:
             pass
         super().closeEvent(event)

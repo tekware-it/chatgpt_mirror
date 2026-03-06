@@ -217,6 +217,10 @@ See `packaging/README.md` for PyInstaller + AppImage/Windows/macOS build scripts
 - Built-in memory monitor in status bar: `Native | Web | Total`.
 - Optional diagnostics:
   - `--mem-accurate` uses Linux PSS (fallback RSS when unavailable).
-  - `--js-mem-log` prints JS DOM/heap stats and WebEngine per-process memory breakdown (`renderer`, `zygote`, ...).
+- `--js-mem-log` prints JS DOM/heap stats and WebEngine per-process memory breakdown (`renderer`, `zygote`, ...).
 - No OpenAI API is used.
 - No private endpoints are called by the app.
+
+## License
+
+MIT (see `LICENSE`).
